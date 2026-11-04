@@ -11,10 +11,15 @@
     repos: [],
     statuses: new Map(),
     loadingAll: false,
+    modal: { dismissible: true, onClose: null, returnFocus: null },
+    confirm: { resolve: null, dismissible: true, returnFocus: null },
     audit: {
-      offset: 0,
-      limit: 50,
+      page: 1,
+      pageSize: 10,
       total: 0,
+      totalPages: 0,
+      from: 0,
+      to: 0,
       items: [],
       repoId: '',
       action: '',
@@ -25,6 +30,23 @@
     roots: null,
     ssh: null,
     sshDraft: { editingId: null, testOutput: null },
+  };
+
+  // 全局禁用原生对话框：所有确认/提示一律走自研 Modal。
+  window.__nativeDialogCalls = { confirm: 0, alert: 0, prompt: 0 };
+  window.confirm = function () {
+    window.__nativeDialogCalls.confirm += 1;
+    console.warn('window.confirm 已被禁用，请使用自研 Modal。');
+    return false;
+  };
+  window.alert = function () {
+    window.__nativeDialogCalls.alert += 1;
+    console.warn('window.alert 已被禁用，请使用自研 Modal。');
+  };
+  window.prompt = function () {
+    window.__nativeDialogCalls.prompt += 1;
+    console.warn('window.prompt 已被禁用，请使用自研 Modal。');
+    return null;
   };
 
   const el = {
@@ -49,6 +71,12 @@
     modalBody: document.getElementById('modal-body'),
     modalFoot: document.getElementById('modal-foot'),
     modalClose: document.getElementById('modal-close'),
+    confirmBackdrop: document.getElementById('confirm-backdrop'),
+    confirmModal: document.getElementById('confirm-modal'),
+    confirmTitle: document.getElementById('confirm-title'),
+    confirmBody: document.getElementById('confirm-body'),
+    confirmFoot: document.getElementById('confirm-foot'),
+    confirmClose: document.getElementById('confirm-close'),
     auditRepo: document.getElementById('audit-repo'),
     auditAction: document.getElementById('audit-action'),
     auditFailed: document.getElementById('audit-failed'),
@@ -56,8 +84,12 @@
     auditBody: document.getElementById('audit-body'),
     auditEmpty: document.getElementById('audit-empty'),
     auditRange: document.getElementById('audit-range'),
+    auditFirst: document.getElementById('audit-first'),
     auditPrev: document.getElementById('audit-prev'),
     auditNext: document.getElementById('audit-next'),
+    auditLast: document.getElementById('audit-last'),
+    auditPage: document.getElementById('audit-page'),
+    auditGoto: document.getElementById('audit-goto'),
   };
 
   const ACTION_LABELS = {
@@ -130,6 +162,44 @@
     if (timeout > 0) {
       window.setTimeout(() => node.remove(), timeout);
     }
+  }
+
+  /**
+   * 复制文本到剪贴板（无剪贴板权限时降级为隐藏 textarea + execCommand）。
+   * 参数：value 待复制文本；label 提示用名称，默认“内容”。
+   * 返回值：Promise<boolean>，是否复制成功。
+   */
+  async function copyText(value, label = '内容') {
+    const text = String(value ?? '');
+    if (!text) return false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        toast(`已复制${label}。`, 'success', 2200);
+        return true;
+      }
+    } catch (_) {
+      // 忽略权限错误，继续走降级方案
+    }
+    try {
+      const area = document.createElement('textarea');
+      area.value = text;
+      area.setAttribute('readonly', 'readonly');
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      const ok = document.execCommand('copy');
+      area.remove();
+      if (ok) {
+        toast(`已复制${label}。`, 'success', 2200);
+        return true;
+      }
+    } catch (_) {
+      // 继续走失败提示
+    }
+    toast(`复制${label}失败，请手动选择文本。`, 'error');
+    return false;
   }
 
   function formatDateTime(iso) {
@@ -209,8 +279,13 @@
     const settings = state.settings || {};
     const identity = settings.default_ssh_identity;
     const roots = settings.allowed_roots || [];
+    const serviceUrl = settings.service_url || `http://${settings.host || '127.0.0.1'}:${settings.port || 8765}`;
     el.identityStrip.hidden = false;
     el.identityStrip.innerHTML = `<span class="identity-dot"></span>
+      <span class="identity-label">访问地址</span>
+      <code class="full-text service-url" id="service-url">${escapeHtml(serviceUrl)}</code>
+      <button class="btn-link" data-copy="${escapeHtml(serviceUrl)}" data-copy-label="访问地址">复制</button>
+      <span class="identity-sep">·</span>
       <span class="identity-label">推送身份</span>
       <span class="identity-name">${escapeHtml(identity ? identity.name : '系统 SSH 默认')}</span>
       ${identity ? '<span class="badge source-default">全局默认</span>' : ''}
@@ -348,6 +423,24 @@
     return '<span class="pill pill-branch">无提交</span>';
   }
 
+  /**
+   * 渲染仓库远端地址（完整展示，不省略，附带复制按钮）。
+   * 参数：status 仓库状态对象（可能为 null）。
+   * 返回值：HTML 字符串；无远端时为空串。
+   */
+  function remoteHtml(status) {
+    if (!status || !Array.isArray(status.remotes) || !status.remotes.length) return '';
+    return status.remotes.map((remote) => {
+      const url = remote.push_url || remote.fetch_url || '';
+      if (!url) return '';
+      return `<div class="remote-line">
+        <span class="label">${escapeHtml(remote.name)}</span>
+        <code class="full-text">${escapeHtml(url)}</code>
+        <button class="btn-link" data-copy="${escapeHtml(url)}" data-copy-label="远端地址">复制</button>
+      </div>`;
+    }).join('');
+  }
+
   function cardHtml(repo, status) {
     const health = healthOf(status);
     const header = `<div class="card-head">
@@ -356,7 +449,8 @@
         <span class="pill is-${health.key}"><span class="dot"></span>${escapeHtml(health.label)}</span>
       </div>
     </div>
-    <div class="repo-path" title="${escapeHtml(repo.path)}">${escapeHtml(repo.path)}</div>`;
+    <div class="repo-path" title="${escapeHtml(repo.path)}">${escapeHtml(repo.path)}</div>
+    ${remoteHtml(status)}`;
 
     if (!status) {
       return `<article class="repo-card" data-id="${repo.id}" data-health="unknown">
@@ -437,6 +531,7 @@
     const chips = [
       dirty.staged ? `<span class="chip is-staged"><span class="dot"></span>已暂存 ${dirty.staged}</span>` : '',
       dirty.modified ? `<span class="chip is-modified"><span class="dot"></span>已修改 ${dirty.modified}</span>` : '',
+      dirty.deleted ? `<span class="chip is-deleted"><span class="dot"></span>已删除 ${dirty.deleted}</span>` : '',
       dirty.untracked ? `<span class="chip is-untracked"><span class="dot"></span>未跟踪 ${dirty.untracked}</span>` : '',
       dirty.conflicts ? `<span class="chip is-conflict"><span class="dot"></span>冲突 ${dirty.conflicts}</span>` : '',
     ].join('');
@@ -444,6 +539,7 @@
     const groups = [
       ['已暂存', status.files.staged, ''],
       ['已修改（未暂存）', status.files.modified, ''],
+      ['已删除（未暂存）', status.files.deleted, 'code-deleted'],
       ['未跟踪', status.files.untracked, ''],
       ['冲突', status.files.conflicts, 'code-conflict'],
     ].filter(([, items]) => items && items.length)
@@ -501,9 +597,12 @@
   async function removeRepo(id) {
     const repo = repoById(id);
     if (!repo) return;
-    const ok = window.confirm(
-      `仅从列表中移除「${repo.name}」的配置记录，不会删除磁盘目录。\n\n确定继续？`
-    );
+    const ok = await confirmDialog({
+      title: '移除仓库',
+      message: `仅从列表中移除「${repo.name}」的配置记录，不会删除磁盘目录。\n确定继续？`,
+      confirmLabel: '移除',
+      danger: true,
+    });
     if (!ok) return;
     try {
       const result = await api(`/api/repos/${id}`, { method: 'DELETE' });
@@ -521,31 +620,125 @@
   // 弹窗基础
   // ------------------------------------------------------------------
 
-  function openModal({ title, body, foot, wide = false }) {
+  /**
+   * 将焦点放到弹窗内的第一个可用交互控件（主按钮优先，其次输入框）。
+   * 参数：preferredSelector 可选的首选选择器。
+   * 返回值：无。
+   */
+  function focusModalStart(preferredSelector = null) {
+    const target = (preferredSelector && el.modal.querySelector(preferredSelector))
+      || el.modal.querySelector('#modal-foot .btn-primary:not([disabled])')
+      || el.modal.querySelector('#modal-body input:not([type="hidden"]):not([disabled]), #modal-body textarea:not([disabled]), #modal-body select:not([disabled])')
+      || el.modal.querySelector('#modal-body button:not([disabled])')
+      || el.modal.querySelector('#modal-foot button:not([disabled])')
+      || el.modalClose;
+    if (target) target.focus();
+  }
+
+  /**
+   * 打开自研 Modal。
+   * 参数：
+   *   title 标题；body/foot HTML 内容；
+   *   wide 是否使用宽版（最大仍不超过 480px）；
+   *   dismissible 是否允许遮罩点击关闭（危险确认应传 false）；
+   *   onClose 关闭回调（确认框用它返回 Promise 结果）；
+   *   autofocus 打开时优先聚焦的选择器。
+   * 返回值：无。
+   */
+  function openModal({ title, body, foot, wide = false, dismissible = true, onClose = null, autofocus = null }) {
+    state.modal.returnFocus = document.activeElement;
+    state.modal.dismissible = dismissible;
+    state.modal.onClose = onClose;
     el.modalTitle.textContent = title;
     el.modalBody.innerHTML = body || '';
     el.modalFoot.innerHTML = foot || '';
     el.modal.classList.toggle('modal-wide', Boolean(wide));
     el.backdrop.hidden = false;
-    document.body.style.overflow = 'hidden';
+    document.body.classList.add('modal-open');
+    window.setTimeout(() => focusModalStart(autofocus), 0);
   }
 
   function setModalBody(html) { el.modalBody.innerHTML = html; }
   function setModalFoot(html) { el.modalFoot.innerHTML = html; }
 
+  /**
+   * 关闭 Modal 并恢复焦点到触发元素。
+   * 参数：无。
+   * 返回值：无。
+   */
   function closeModal() {
+    if (el.backdrop.hidden) return;
+    if (!el.confirmBackdrop.hidden) closeConfirm(false);
     if (state.scan && state.scan.pollTimer) {
       window.clearTimeout(state.scan.pollTimer);
     }
+    const onClose = state.modal.onClose;
+    const returnFocus = state.modal.returnFocus;
+    state.modal.onClose = null;
     el.backdrop.hidden = true;
     el.modalBody.innerHTML = '';
     el.modalFoot.innerHTML = '';
-    document.body.style.overflow = '';
+    document.body.classList.remove('modal-open');
     state.browse = null;
     state.scan = null;
     state.roots = null;
     state.ssh = null;
     state.sshDraft = { editingId: null, testOutput: null };
+    if (typeof onClose === 'function') onClose();
+    if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
+      returnFocus.focus();
+    }
+  }
+
+  /**
+   * 关闭确认层并返回结果（不影响其下方的业务弹窗）。
+   * 参数：value 是否确认。
+   * 返回值：无。
+   */
+  function closeConfirm(value) {
+    if (el.confirmBackdrop.hidden) return;
+    const resolve = state.confirm.resolve;
+    const returnFocus = state.confirm.returnFocus;
+    state.confirm.resolve = null;
+    state.confirm.returnFocus = null;
+    el.confirmBackdrop.hidden = true;
+    el.confirmBody.innerHTML = '';
+    el.confirmFoot.innerHTML = '';
+    if (!el.backdrop.hidden) document.body.classList.add('modal-open');
+    else document.body.classList.remove('modal-open');
+    if (typeof resolve === 'function') resolve(Boolean(value));
+    if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
+      returnFocus.focus();
+    }
+  }
+
+  /**
+   * 自研确认弹窗，替代 window.confirm；层级高于业务弹窗，不销毁业务弹窗内容。
+   * 参数：
+   *   title 标题；message 正文（纯文本）；confirmLabel 确认按钮文案；
+   *   danger 是否危险操作（确认按钮语义红，禁止点击遮罩关闭）。
+   * 返回值：Promise<boolean>，确认返回 true，取消/ESC/关闭返回 false。
+   */
+  function confirmDialog({ title, message, confirmLabel = '确认', danger = false }) {
+    return new Promise((resolve) => {
+      if (!el.confirmBackdrop.hidden) closeConfirm(false);
+      state.confirm.resolve = resolve;
+      state.confirm.dismissible = !danger;
+      state.confirm.returnFocus = document.activeElement;
+      el.confirmTitle.textContent = title;
+      el.confirmBody.innerHTML = `<p class="confirm-text">${escapeHtml(message).replace(/\n/g, '<br>')}</p>`;
+      el.confirmFoot.innerHTML = `<button class="btn btn-ghost" id="confirm-cancel">取消</button>
+        <button class="btn ${danger ? 'btn-danger-solid' : 'btn-primary'}" id="confirm-ok" data-autofocus>${escapeHtml(confirmLabel)}</button>`;
+      el.confirmBackdrop.hidden = false;
+      document.body.classList.add('modal-open');
+      const okBtn = document.getElementById('confirm-ok');
+      const cancelBtn = document.getElementById('confirm-cancel');
+      if (okBtn) {
+        okBtn.addEventListener('click', () => closeConfirm(true));
+      }
+      if (cancelBtn) cancelBtn.addEventListener('click', () => closeConfirm(false));
+      if (okBtn) window.setTimeout(() => okBtn.focus(), 0);
+    });
   }
 
   function showModalError(message) {
@@ -644,12 +837,23 @@
     if (!repo) return;
 
     let remotes = [];
+    let remoteDetails = [];
     try {
       const data = await api(`/api/repos/${id}/remotes`);
       remotes = data.items || [];
+      remoteDetails = data.remotes || [];
     } catch (err) {
       toast(`读取远端列表失败：${err.message}`, 'error');
     }
+
+    const remoteListHtml = remoteDetails.length
+      ? `<div class="remote-list">${remoteDetails.map((remote) => `
+          <div class="remote-line">
+            <span class="label">${escapeHtml(remote.name)}</span>
+            <code class="full-text">${escapeHtml(remote.push_url || remote.fetch_url)}</code>
+            <button class="btn-link" data-copy="${escapeHtml(remote.push_url || remote.fetch_url)}" data-copy-label="远端地址">复制</button>
+          </div>`).join('')}</div>`
+      : '';
 
     const upstream = status && status.upstream ? status.upstream : null;
     const branch = status && status.branch ? status.branch : null;
@@ -691,6 +895,7 @@
           <div><div class="name">${escapeHtml(repo.name)}</div><div class="path">${escapeHtml(repo.path)}</div></div>
         </div>
         ${upstreamSection}
+        ${remoteListHtml}
         ${forceSection}
         <div class="error-box" id="modal-error" hidden></div>
       `,
@@ -740,11 +945,14 @@
       };
       forceEnable.addEventListener('change', syncForce);
       forceAck.addEventListener('change', syncForce);
-      forceRun.addEventListener('click', () => {
+      forceRun.addEventListener('click', async () => {
         if (!(forceEnable.checked && forceAck.checked)) return;
-        const ok = window.confirm(
-          '二次确认：确定执行强制推送（--force-with-lease）？\n该操作可能改写远端历史，并会记录审计日志。'
-        );
+        const ok = await confirmDialog({
+          title: '二次确认：强制推送',
+          message: '确定执行强制推送（--force-with-lease）？\n该操作可能改写远端历史，并会记录审计日志。',
+          confirmLabel: '强制推送',
+          danger: true,
+        });
         if (!ok) return;
         runPush(true);
       });
@@ -771,6 +979,7 @@
     const groupOrder = [
       ['staged', '已暂存'],
       ['modified', '已修改（未暂存）'],
+      ['deleted', '已删除（未暂存）'],
       ['untracked', '未跟踪'],
       ['conflicts', '冲突'],
     ];
@@ -804,6 +1013,7 @@
     openModal({
       title: `提交 · ${repo.name}`,
       wide: true,
+      autofocus: '#commit-message',
       body: `
         <div class="repo-reference">
           <div><div class="name">${escapeHtml(repo.name)}</div><div class="path">${escapeHtml(repo.path)}</div></div>
@@ -815,6 +1025,7 @@
             <label class="check"><input type="checkbox" id="commit-all"><span>全选</span></label>
           </div>
           <div class="commit-groups">${groupsHtml || '<div class="dir-empty">工作区没有可提交的变更。</div>'}</div>
+          <div class="selection-hint" id="commit-hint" ${merged.size ? '' : 'hidden'}>请至少勾选一项变更</div>
         </div>
         <div class="form-section">
           <label class="field"><span>提交信息</span>
@@ -832,15 +1043,25 @@
 
     const allBox = document.getElementById('commit-all');
     const checks = Array.from(document.querySelectorAll('.commit-check')).filter((box) => !box.disabled);
+    const hint = document.getElementById('commit-hint');
+    const submitBtn = document.getElementById('commit-submit');
     const selectedCount = () => checks.filter((box) => box.checked).length;
+
+    // 根据勾选状态同步提交按钮与提示（空勾选时禁用并提示）
+    const syncCommitState = () => {
+      const count = selectedCount();
+      submitBtn.disabled = Boolean(conflicts.length) || count === 0;
+      allBox.checked = count > 0 && count === checks.length;
+      if (hint) hint.hidden = count > 0 || !checks.length;
+    };
 
     allBox.addEventListener('change', () => {
       checks.forEach((box) => { box.checked = allBox.checked; });
       if (!checks.length) allBox.checked = false;
+      syncCommitState();
     });
-    checks.forEach((box) => box.addEventListener('change', () => {
-      allBox.checked = selectedCount() === checks.length;
-    }));
+    checks.forEach((box) => box.addEventListener('change', syncCommitState));
+    syncCommitState();
 
     const messageInput = document.getElementById('commit-message');
     const countLabel = document.getElementById('commit-count');
@@ -849,12 +1070,11 @@
     });
     messageInput.focus();
 
-    const submitBtn = document.getElementById('commit-submit');
     submitBtn.addEventListener('click', async () => {
       clearModalError();
       const files = selectedCount() ? checks.filter((box) => box.checked).map((box) => box.value) : [];
       const message = messageInput.value.trim();
-      if (!files.length) { showModalError('请至少勾选一个文件。'); return; }
+      if (!files.length) { showModalError('请至少勾选一项变更。'); return; }
       if (!message) { showModalError('提交信息不能为空。'); return; }
       busyButton(submitBtn, true);
       try {
@@ -866,12 +1086,16 @@
         toast(`提交成功：${result.commit.short} ${result.commit.subject}`, 'success', 6000);
         await refreshOne(id, true);
       } catch (err) {
+        // git 非零退出时原样透出命令、退出码与输出
         let text = err.message;
-        if (err.payload && err.payload.output) text += `\n${err.payload.output}`;
+        if (err.payload && err.payload.output && !text.includes(err.payload.output)) {
+          text += `\n${err.payload.output}`;
+        }
         showModalError(text);
         refreshOne(id, true);
       } finally {
         busyButton(submitBtn, false);
+        syncCommitState();
       }
     });
   }
@@ -907,6 +1131,7 @@
       } else {
         renderAddRepo();
       }
+      focusModalStart();
     } catch (err) {
       showModalError(`读取白名单目录失败：${err.message}`);
     }
@@ -1122,6 +1347,15 @@
       return;
     }
 
+    if (paths.length > 1) {
+      const ok = await confirmDialog({
+        title: '批量添加仓库',
+        message: `将把 ${paths.length} 个仓库加入管理列表（仅注册路径，不会修改仓库内容）。`,
+        confirmLabel: '批量添加',
+      });
+      if (!ok) return;
+    }
+
     const submitBtn = document.getElementById('add-submit');
     busyButton(submitBtn, true);
     clearModalError();
@@ -1195,7 +1429,9 @@
     const rows = roots.length
       ? roots.map((root) => `<div class="root-row">
           <div class="root-row-main">
-            <div class="root-row-path" title="${escapeHtml(root.path)}">${escapeHtml(root.path)}</div>
+            <div class="root-row-path">${escapeHtml(root.path)}
+              <button class="btn-link" data-copy="${escapeHtml(root.path)}" data-copy-label="根目录路径">复制</button>
+            </div>
             <div class="root-row-meta">${escapeHtml(String(root.managed_repos))} 个受管仓库</div>
           </div>
           <button class="btn btn-danger btn-sm" data-root-remove="${root.id}">移除</button>
@@ -1246,18 +1482,30 @@
     const item = (state.roots ? state.roots.items : []).find((root) => root.id === id);
     if (!item) return;
     const baseMessage = item.managed_repos
-      ? `该根目录下仍有 ${item.managed_repos} 个受管仓库。移除后这些仓库仍保留在列表，但会超出白名单而不可操作。\n\n继续移除？`
+      ? `该根目录下仍有 ${item.managed_repos} 个受管仓库。移除后这些仓库仍保留在列表，但会超出白名单而不可操作。\n继续移除？`
       : `确定从白名单移除「${item.path}」？不会删除磁盘目录。`;
-    if (!window.confirm(baseMessage)) return;
+    const ok = await confirmDialog({
+      title: '移除根目录',
+      message: baseMessage,
+      confirmLabel: '移除',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       const result = await api(`/api/allowed-roots/${id}`, { method: 'DELETE' });
       await afterRootChange(result.message);
     } catch (err) {
       if (err.status === 409 && err.payload && err.payload.code === 'root_in_use') {
-        if (!window.confirm(`${err.message}\n\n确认仍要移除？`)) return;
+        const forced = await confirmDialog({
+          title: '强制移除根目录',
+          message: `${err.message}\n确认仍要移除？`,
+          confirmLabel: '强制移除',
+          danger: true,
+        });
+        if (!forced) return;
         try {
-          const forced = await api(`/api/allowed-roots/${id}?force=true`, { method: 'DELETE' });
-          await afterRootChange(forced.message);
+          const forcedResult = await api(`/api/allowed-roots/${id}?force=true`, { method: 'DELETE' });
+          await afterRootChange(forcedResult.message);
         } catch (secondErr) {
           showModalError(`移除失败：${secondErr.message}`);
         }
@@ -1505,6 +1753,12 @@
     if (!scan || !scan.selected.size) return;
     const paths = Array.from(scan.selected);
     const button = document.getElementById('scan-add');
+    const ok = await confirmDialog({
+      title: '批量添加仓库',
+      message: `将把扫描选中的 ${paths.length} 个仓库加入管理列表（仅注册路径，不会修改仓库内容）。`,
+      confirmLabel: '批量添加',
+    });
+    if (!ok) return;
     busyButton(button, true);
     try {
       const result = await api('/api/repos', { method: 'POST', body: { paths } });
@@ -1575,8 +1829,12 @@
         return `<div class="ssh-row ${item.enabled ? '' : 'is-disabled'}" data-ssh-row="${item.id}">
           <div class="ssh-row-main">
             <div class="ssh-row-title"><span class="ssh-name">${escapeHtml(item.name)}</span> ${flags}</div>
-            <div class="ssh-row-meta"><span title="${escapeHtml(item.key_path)}">${escapeHtml(item.key_path)}</span>
-              ${item.host_alias ? ` · Host ${escapeHtml(item.host_alias)}` : ' · 未配置 Host'}</div>
+            <div class="ssh-row-meta">
+              <code class="full-text">${escapeHtml(item.key_path)}</code>
+              <button class="btn-link" data-copy="${escapeHtml(item.key_path)}" data-copy-label="私钥路径">复制</button>
+              ${item.host_alias ? ` · Host <code class="full-text">${escapeHtml(item.host_alias)}</code>
+                <button class="btn-link" data-copy="${escapeHtml(item.host_alias)}" data-copy-label="Host 别名">复制</button>` : ' · 未配置 Host'}
+            </div>
             <div class="ssh-row-meta">${item.fingerprint ? `指纹 ${escapeHtml(item.fingerprint)}` : escapeHtml((item.warnings || []).join('；') || '无指纹信息')}</div>
           </div>
           <div class="ssh-row-actions">
@@ -1597,7 +1855,10 @@
               ${key.configured ? '<span class="badge ok">已配置</span>' : ''}
               ${key.encrypted ? '<span class="badge warn">已加密</span>' : ''}
               ${key.readable ? '' : '<span class="badge fail">不可读</span>'}</div>
-            <div class="ssh-row-meta" title="${escapeHtml(key.key_path)}">${escapeHtml(key.key_path)}</div>
+            <div class="ssh-row-meta">
+              <code class="full-text">${escapeHtml(key.key_path)}</code>
+              <button class="btn-link" data-copy="${escapeHtml(key.key_path)}" data-copy-label="私钥路径">复制</button>
+            </div>
             <div class="ssh-row-meta">${key.fingerprint ? `指纹 ${escapeHtml(key.fingerprint)}${key.bits ? ` · ${escapeHtml(key.bits)} 位` : ''}` : escapeHtml(key.warnings.join('；') || '无指纹信息')}
               ${key.suggested_alias ? ` · 建议 Host ${escapeHtml(key.suggested_alias)}` : ''}
               ${key.comment ? ` · ${escapeHtml(key.comment)}` : ''}</div>
@@ -1728,7 +1989,13 @@
   async function deleteSshIdentity(id) {
     const item = state.ssh.identities.find((candidate) => candidate.id === id);
     if (!item) return;
-    if (!window.confirm(`删除身份「${item.name}」的配置记录？\n不会删除磁盘私钥文件，相关仓库绑定会被解除。`)) return;
+    const ok = await confirmDialog({
+      title: '删除 SSH 身份',
+      message: `删除身份「${item.name}」的配置记录？\n不会删除磁盘私钥文件，相关仓库绑定会被解除。`,
+      confirmLabel: '删除',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       const result = await api(`/api/ssh/identities/${id}`, { method: 'DELETE' });
       await loadSettings();
@@ -1885,8 +2152,8 @@
 
   async function loadAudit() {
     const params = new URLSearchParams();
-    params.set('limit', String(state.audit.limit));
-    params.set('offset', String(state.audit.offset));
+    params.set('page', String(state.audit.page));
+    params.set('page_size', String(state.audit.pageSize));
     if (state.audit.repoId) params.set('repo_id', state.audit.repoId);
     if (state.audit.action) params.set('action', state.audit.action);
     if (state.audit.onlyFailed) params.set('only_failed', 'true');
@@ -1895,6 +2162,10 @@
     try {
       const data = await api(`/api/audit?${params.toString()}`);
       state.audit.total = data.total || 0;
+      state.audit.totalPages = data.total_pages || 0;
+      state.audit.page = data.page || 1;
+      state.audit.from = data.from || 0;
+      state.audit.to = data.to || 0;
       state.audit.items = data.items || [];
       renderAudit();
     } catch (err) {
@@ -1904,14 +2175,32 @@
     }
   }
 
+  /**
+   * 同步审计分页控件状态（首末页置灰、页码输入范围、页码显示）。
+   * 参数：无。
+   * 返回值：无。
+   */
+  function syncAuditPager() {
+    const totalPages = state.audit.totalPages;
+    const page = state.audit.page;
+    const noPages = totalPages <= 0;
+    el.auditFirst.disabled = noPages || page <= 1;
+    el.auditPrev.disabled = noPages || page <= 1;
+    el.auditNext.disabled = noPages || page >= totalPages;
+    el.auditLast.disabled = noPages || page >= totalPages;
+    el.auditGoto.disabled = noPages || totalPages <= 1;
+    el.auditPage.disabled = noPages;
+    el.auditPage.max = String(Math.max(1, totalPages));
+    el.auditPage.value = String(noPages ? 1 : page);
+  }
+
   function renderAudit() {
     const items = state.audit.items;
     if (!items.length) {
       el.auditBody.innerHTML = '';
       el.auditEmpty.hidden = false;
-      el.auditRange.textContent = '共 0 条记录';
-      el.auditPrev.disabled = true;
-      el.auditNext.disabled = true;
+      el.auditRange.textContent = `共 ${state.audit.total} 条 / 第 0-0 条`;
+      syncAuditPager();
       return;
     }
     el.auditEmpty.hidden = true;
@@ -1946,11 +2235,21 @@
       </td></tr>`;
     }).join('');
 
-    const from = state.audit.offset + 1;
-    const to = Math.min(state.audit.offset + items.length, state.audit.total);
-    el.auditRange.textContent = `第 ${from}-${to} 条 / 共 ${state.audit.total} 条`;
-    el.auditPrev.disabled = state.audit.offset <= 0;
-    el.auditNext.disabled = state.audit.offset + items.length >= state.audit.total;
+    el.auditRange.textContent = `共 ${state.audit.total} 条 / 第 ${state.audit.from}-${state.audit.to} 条`
+      + ` · 第 ${state.audit.page}/${Math.max(1, state.audit.totalPages)} 页`;
+    syncAuditPager();
+  }
+
+  /**
+   * 跳转到指定审计页（自动收敛到合法范围）。
+   * 参数：page 目标页码。
+   * 返回值：无。
+   */
+  function gotoAuditPage(page) {
+    const totalPages = state.audit.totalPages;
+    const target = totalPages <= 0 ? 1 : Math.max(1, Math.min(Number(page) || 1, totalPages));
+    state.audit.page = target;
+    loadAudit();
   }
 
   // ------------------------------------------------------------------
@@ -1975,44 +2274,82 @@
       handleCardAction(button.dataset.act, Number(card.dataset.id));
     });
 
+    // 统一的“复制”按钮（data-copy 携带完整文本）
+    document.addEventListener('click', (event) => {
+      const copyBtn = event.target.closest('[data-copy]');
+      if (!copyBtn) return;
+      event.preventDefault();
+      copyText(copyBtn.dataset.copy, copyBtn.dataset.copyLabel || '内容');
+    });
+
     el.modalClose.addEventListener('click', closeModal);
     el.backdrop.addEventListener('click', (event) => {
-      if (event.target === el.backdrop) closeModal();
+      // 危险确认不允许点击遮罩关闭，必须显式点“取消”
+      if (event.target === el.backdrop && state.modal.dismissible) closeModal();
+    });
+    el.confirmClose.addEventListener('click', () => closeConfirm(false));
+    el.confirmBackdrop.addEventListener('click', (event) => {
+      if (event.target === el.confirmBackdrop && state.confirm.dismissible) {
+        closeConfirm(false);
+      }
     });
     document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape' && !el.backdrop.hidden) closeModal();
+      const confirmOpen = !el.confirmBackdrop.hidden;
+      const modalOpen = !el.backdrop.hidden;
+      if (!confirmOpen && !modalOpen) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        if (confirmOpen) closeConfirm(false);
+        else closeModal();
+        return;
+      }
+      // 焦点陷阱：确认层优先，其次业务弹窗
+      if (event.key !== 'Tab') return;
+      const scope = confirmOpen ? el.confirmModal : el.modal;
+      const focusables = Array.from(scope.querySelectorAll(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]),'
+        + ' textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )).filter((node) => node.offsetParent !== null);
+      if (!focusables.length) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     });
 
     el.auditRefresh.addEventListener('click', () => {
-      state.audit.offset = 0;
+      state.audit.page = 1;
       loadAudit();
     });
     el.auditRepo.addEventListener('change', () => {
       state.audit.repoId = el.auditRepo.value;
-      state.audit.offset = 0;
+      state.audit.page = 1;
       loadAudit();
     });
     el.auditAction.addEventListener('change', () => {
       state.audit.action = el.auditAction.value;
-      state.audit.offset = 0;
+      state.audit.page = 1;
       loadAudit();
     });
     el.auditFailed.addEventListener('change', () => {
       state.audit.onlyFailed = el.auditFailed.checked;
-      state.audit.offset = 0;
+      state.audit.page = 1;
       loadAudit();
     });
-    el.auditPrev.addEventListener('click', () => {
-      if (state.audit.offset > 0) {
-        state.audit.offset = Math.max(0, state.audit.offset - state.audit.limit);
-        loadAudit();
-      }
-    });
-    el.auditNext.addEventListener('click', () => {
-      if (state.audit.offset + state.audit.items.length < state.audit.total) {
-        state.audit.offset += state.audit.limit;
-        loadAudit();
-      }
+    el.auditFirst.addEventListener('click', () => gotoAuditPage(1));
+    el.auditPrev.addEventListener('click', () => gotoAuditPage(state.audit.page - 1));
+    el.auditNext.addEventListener('click', () => gotoAuditPage(state.audit.page + 1));
+    el.auditLast.addEventListener('click', () => gotoAuditPage(state.audit.totalPages));
+    el.auditGoto.addEventListener('click', () => gotoAuditPage(el.auditPage.value));
+    el.auditPage.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      gotoAuditPage(el.auditPage.value);
     });
     el.auditBody.addEventListener('click', (event) => {
       const row = event.target.closest('.audit-row');

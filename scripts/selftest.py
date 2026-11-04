@@ -263,6 +263,7 @@ def main() -> int:
     notrepo_dir = test_root / "notrepo"
     scan_root = test_root / "scanroot"
     ssh_repo_dir = test_root / "ssh-repo"
+    mixed_dir = test_root / "mixed"
     ssh_dir = test_root / "ssh"
     extra_root: Path | None = None
     selftest_db = PROJECT_ROOT / "data" / "selftest.db"
@@ -792,6 +793,177 @@ def main() -> int:
             "移除仓库后审计历史仍保留",
             status == 200 and (history or {}).get("total", 0) > 0,
             f"history={(history or {}).get('total')}",
+        )
+
+        # ---------- 12.5 提交缺陷回归：删除/修改/新增/中文文件名 ----------
+        make_repo(mixed_dir)
+        write_file(mixed_dir / "删除文件.txt", "待删除内容\n")
+        write_file(mixed_dir / "修改文件.txt", "版本 1\n")
+        write_file(mixed_dir / "中文文件名.txt", "初始内容\n")
+        run_git(git_exe, ["add", "."], cwd=mixed_dir)
+        run_git(git_exe, ["commit", "-m", "chore: mixed fixture"], cwd=mixed_dir)
+        (mixed_dir / "删除文件.txt").unlink()
+        write_file(mixed_dir / "修改文件.txt", "版本 2\n")
+        write_file(mixed_dir / "新增文件.txt", "未跟踪内容\n")
+
+        status, mixed_added = http_call("POST", base, "/api/repos", {"paths": [str(mixed_dir)]})
+        mixed_id = int(((((mixed_added or {}).get("results") or [{}])[0]).get("repo_id")) or 0)
+        check("添加混合变更测试仓库", status == 200 and mixed_id > 0, f"repo_id={mixed_id}")
+
+        status, mixed_changes = http_call("GET", base, f"/api/repos/{mixed_id}/changes")
+        mixed_files = (mixed_changes or {}).get("files") or []
+        mixed_counts = (mixed_changes or {}).get("counts") or {}
+        deleted_paths = [item["path"] for item in mixed_files if item.get("group") == "deleted"]
+        check(
+            "状态模型包含已删除类别",
+            status == 200 and mixed_counts.get("deleted") == 1 and "删除文件.txt" in deleted_paths,
+            str(mixed_counts),
+        )
+        check(
+            "中文路径原样输出（无八进制转义）",
+            all("\\344" not in item.get("path", "") for item in mixed_files)
+            and "修改文件.txt" in [item["path"] for item in mixed_files],
+            str([item.get("path") for item in mixed_files]),
+        )
+        check(
+            "四类变更同时可见（已修改/已删除/未跟踪）",
+            mixed_counts.get("modified") == 1
+            and mixed_counts.get("deleted") == 1
+            and mixed_counts.get("untracked") == 1,
+            str(mixed_counts),
+        )
+
+        status, del_commit = http_call(
+            "POST",
+            base,
+            f"/api/repos/{mixed_id}/commit",
+            {"files": ["删除文件.txt"], "message": "fix: 删除废弃文档"},
+        )
+        check("仅勾选已删除文件可提交成功", status == 200 and (del_commit or {}).get("ok") is True, str((del_commit or {}).get("commit")))
+        mixed_status = run_git(
+            git_exe, ["-c", "core.quotepath=false", "status", "--porcelain"], cwd=mixed_dir
+        ).stdout
+        check(
+            "删除提交后不再出现已删除条目",
+            "删除文件.txt" not in mixed_status and "修改文件.txt" in mixed_status
+            and "新增文件.txt" in mixed_status,
+            mixed_status.replace("\n", " | "),
+        )
+
+        status, mod_commit = http_call(
+            "POST",
+            base,
+            f"/api/repos/{mixed_id}/commit",
+            {"files": ["修改文件.txt"], "message": "fix: 更新修改文件"},
+        )
+        check("仅勾选修改文件可提交成功", status == 200 and (mod_commit or {}).get("ok") is True, str((mod_commit or {}).get("commit")))
+        mixed_status2 = run_git(
+            git_exe, ["-c", "core.quotepath=false", "status", "--porcelain"], cwd=mixed_dir
+        ).stdout
+        check(
+            "仅提交修改项不影响未跟踪文件",
+            mixed_status2.strip() == "?? 新增文件.txt",
+            mixed_status2.replace("\n", " | "),
+        )
+
+        status, cn_commit = http_call(
+            "POST",
+            base,
+            f"/api/repos/{mixed_id}/commit",
+            {"files": ["新增文件.txt"], "message": "feat: 新增中文名文件"},
+        )
+        check("中文文件名可正常提交", status == 200 and (cn_commit or {}).get("ok") is True, str((cn_commit or {}).get("commit")))
+        mixed_status3 = run_git(
+            git_exe, ["-c", "core.quotepath=false", "status", "--porcelain"], cwd=mixed_dir
+        ).stdout
+        check("混合场景全部提交后工作区干净", mixed_status3.strip() == "", mixed_status3)
+
+        status, empty_commit = http_call(
+            "POST",
+            base,
+            f"/api/repos/{mixed_id}/commit",
+            {"files": [], "message": "chore: empty"},
+        )
+        check("空勾选提交被后端拒绝", status == 400, str((empty_commit or {}).get("code")))
+
+        status, stage_audit = http_call(
+            "GET", base, f"/api/audit?repo_id={mixed_id}&action=stage&page=1&page_size=10"
+        )
+        stage_rows = (stage_audit or {}).get("items") or []
+        check(
+            "暂存命令使用 quotepath=false 与 add -A",
+            bool(stage_rows)
+            and all("core.quotepath=false" in row.get("command", "") and "add -A" in row.get("command", "") for row in stage_rows),
+            str([row.get("command") for row in stage_rows][:1]),
+        )
+
+        # ---------- 12.6 审计服务端分页 ----------
+        status, page_one = http_call("GET", base, "/api/audit?page=1&page_size=10")
+        page_one = page_one or {}
+        check(
+            "审计第 1 页返回页码元信息",
+            status == 200 and page_one.get("page") == 1 and page_one.get("page_size") == 10
+            and page_one.get("from") == 1 and page_one.get("to") == min(10, page_one.get("total", 0)),
+            f"page={page_one.get('page')} range={page_one.get('from')}-{page_one.get('to')}",
+        )
+        check(
+            "审计每页固定 10 条且 total_pages 正确",
+            len(page_one.get("items") or []) == min(10, page_one.get("total", 0))
+            and page_one.get("total_pages") == (page_one.get("total", 0) + 9) // 10,
+            f"items={len(page_one.get('items') or [])} total_pages={page_one.get('total_pages')}",
+        )
+        status, page_two = http_call("GET", base, "/api/audit?page=2&page_size=10")
+        page_two = page_two or {}
+        page_two_ids = [row.get("id") for row in page_two.get("items") or []]
+        page_one_ids = [row.get("id") for row in page_one.get("items") or []]
+        check(
+            "审计第 2 页数据不与第 1 页重复",
+            status == 200 and page_two.get("page") == 2
+            and not set(page_two_ids) & set(page_one_ids),
+            f"page2_items={len(page_two_ids)}",
+        )
+        status, page_last = http_call("GET", base, f"/api/audit?page={page_one.get('total_pages')}&page_size=10")
+        page_last = page_last or {}
+        check(
+            "审计末页页码与区间正确",
+            status == 200 and page_last.get("page") == page_one.get("total_pages")
+            and page_last.get("to") == page_last.get("total"),
+            f"page={page_last.get('page')} to={page_last.get('to')} total={page_last.get('total')}",
+        )
+        status, page_over = http_call("GET", base, f"/api/audit?page={(page_one.get('total_pages') or 1) + 5}&page_size=10")
+        page_over = page_over or {}
+        check(
+            "审计页码越界自动收敛到末页",
+            status == 200 and page_over.get("page") == page_one.get("total_pages"),
+            f"page={page_over.get('page')}",
+        )
+        status, page_zero = http_call("GET", base, "/api/audit?page=1&page_size=10&action=__no_such_action__")
+        page_zero = page_zero or {}
+        check(
+            "审计无结果时 total_pages=0 且返回空列表",
+            status == 200 and page_zero.get("total_pages") == 0
+            and page_zero.get("page") == 1 and page_zero.get("items") == []
+            and page_zero.get("from") == 0 and page_zero.get("to") == 0,
+            f"total={page_zero.get('total')} pages={page_zero.get('total_pages')}",
+        )
+        status, filtered_page = http_call(
+            "GET", base, f"/api/audit?page=1&page_size=10&action=commit&repo_id={mixed_id}&only_failed=false"
+        )
+        filtered_page = filtered_page or {}
+        check(
+            "审计筛选条件在分页查询中保持",
+            status == 200 and filtered_page.get("page") == 1
+            and all(row.get("action") == "commit" and row.get("repo_id") == mixed_id
+                    for row in filtered_page.get("items") or []),
+            f"items={len(filtered_page.get('items') or [])}",
+        )
+        status, mixed_remotes = http_call("GET", base, f"/api/repos/{mixed_id}/status")
+        remotes = (mixed_remotes or {}).get("remotes") or []
+        check(
+            "状态接口返回远端完整地址字段",
+            status == 200 and isinstance(remotes, list)
+            and all("fetch_url" in item for item in remotes),
+            str(remotes),
         )
 
         # ---------- 13. 仓库扫描（只读、跳过噪音、深度与结果上限） ----------

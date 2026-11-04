@@ -22,7 +22,7 @@ from .db import Database
 from .git_runner import GitExecutor
 from .services import ApiError, GitManagerService
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_DIR = Path(__file__).resolve().parent
 
 settings: Settings = load_settings()
@@ -276,6 +276,7 @@ def get_settings() -> dict[str, Any]:
     return {
         "host": settings.host,
         "port": settings.port,
+        "service_url": f"http://{settings.host}:{settings.port}",
         "git_executable": settings.git_executable,
         "allowed_roots": [str(root) for root in roots],
         "log_retention_days": settings.log_retention_days,
@@ -671,24 +672,35 @@ def bind_repo_ssh_identity(repo_id: int, payload: RepoSshBindRequest) -> dict[st
 
 @app.get("/api/audit")
 def query_audit(
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    page: int | None = Query(None, ge=1, description="页码（从 1 开始；与 limit/offset 二选一）"),
+    page_size: int = Query(10, ge=1, le=50, description="每页条数（默认 10）"),
+    limit: int | None = Query(None, ge=1, le=200, description="兼容旧版：每页条数"),
+    offset: int = Query(0, ge=0, description="兼容旧版：偏移量"),
     repo_id: int | None = Query(None, ge=1),
     action: str | None = Query(None, max_length=64),
     only_failed: bool = Query(False),
 ) -> dict[str, Any]:
-    """分页查询操作审计。
+    """分页查询操作审计（服务端分页）。
 
     参数：
-        limit: 每页条数。
-        offset: 偏移量。
+        page: 页码（1 开始，越界自动收敛到最后页）。
+        page_size: 每页条数，默认 10。
+        limit: 旧版每页条数（未传 page 时生效）。
+        offset: 旧版偏移量（未传 page 时生效）。
         repo_id: 可选仓库过滤。
         action: 可选动作过滤。
         only_failed: 是否只看失败记录。
     返回值：
-        {"total": int, "items": [...]}。
+        页码模式返回 total/total_pages/page/page_size/from/to/items；
+        旧版模式返回 total/items。
     """
-    return service.query_audit(limit, offset, repo_id, action, only_failed)
+    if page is None and (limit is not None or offset > 0):
+        return service.query_audit_legacy(
+            limit or 50, offset, repo_id, action, only_failed
+        )
+    return service.query_audit(
+        page or 1, page_size, repo_id, action, only_failed
+    )
 
 
 @app.get("/api/audit/actions")

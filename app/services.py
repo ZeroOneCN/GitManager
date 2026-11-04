@@ -22,6 +22,9 @@ from .git_runner import GitExecutor, GitResult
 from .scanner import ScanManager
 from .ssh_service import SshService
 
+# 状态与提交相关命令统一关闭 quotepath，保证中文路径原样输出、可被前端匹配。
+QUOTEPATH_ARGS = ["-c", "core.quotepath=false"]
+
 
 class ApiError(Exception):
     """业务错误：携带错误码、中文原因、HTTP 状态码与附加字段。"""
@@ -71,7 +74,11 @@ def _error_from_result(
     )
     if code == "network_error":
         status_code = 502
-    payload = {"output": (result.stderr or result.stdout or "").strip()[-1000:]}
+    payload = {
+        "output": (result.stderr or result.stdout or "").strip()[-1000:],
+        "command": result.command,
+        "exit_code": result.exit_code,
+    }
     if extra:
         payload.update(extra)
     return ApiError(code, message, status_code, payload)
@@ -817,7 +824,7 @@ class GitManagerService:
             repo["id"],
             repo["path"],
             "status",
-            ["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+            [*QUOTEPATH_ARGS, "status", "--porcelain=v1", "-z", "--untracked-files=normal"],
         )
 
     def _collect_dirty(self, repo: dict[str, Any]) -> dict[str, Any]:
@@ -943,8 +950,22 @@ class GitManagerService:
             "head_sha": None,
             "upstream": None,
             "upstream_status": None,
-            "dirty": {"total": 0, "staged": 0, "modified": 0, "untracked": 0, "conflicts": 0},
-            "files": {"staged": [], "modified": [], "untracked": [], "conflicts": []},
+            "dirty": {
+                "total": 0,
+                "staged": 0,
+                "modified": 0,
+                "deleted": 0,
+                "untracked": 0,
+                "conflicts": 0,
+            },
+            "files": {
+                "staged": [],
+                "modified": [],
+                "deleted": [],
+                "untracked": [],
+                "conflicts": [],
+            },
+            "remotes": [],
             "last_commit": None,
             "last_fetch_at": None,
             "ssh_identity": None,
@@ -978,6 +999,7 @@ class GitManagerService:
         base["files"] = {
             "staged": parsed["staged"],
             "modified": parsed["modified"],
+            "deleted": parsed["deleted"],
             "untracked": parsed["untracked"],
             "conflicts": parsed["conflicts"],
         }
@@ -985,9 +1007,12 @@ class GitManagerService:
             "total": parsed["counts"]["total"],
             "staged": parsed["counts"]["staged"],
             "modified": parsed["counts"]["modified"],
+            "deleted": parsed["counts"]["deleted"],
             "untracked": parsed["counts"]["untracked"],
             "conflicts": parsed["counts"]["conflicts"],
         }
+
+        base["remotes"] = self._read_remotes(repo)
 
         branch, detached, head_sha = self._read_branch(repo)
         base["branch"] = branch
@@ -1175,6 +1200,39 @@ class GitManagerService:
     # push
     # ------------------------------------------------------------------
 
+    def _read_remotes(self, repo: dict[str, Any]) -> list[dict[str, str]]:
+        """读取仓库远端名称与完整地址（不做截断，供前端完整展示）。
+
+        参数：
+            repo: 仓库字典。
+        返回值：
+            [{name, fetch_url, push_url}]；失败时返回空列表。
+        """
+        result = self.executor.run(
+            repo["id"],
+            repo["path"],
+            "remote_list",
+            [*QUOTEPATH_ARGS, "remote", "-v"],
+        )
+        if not result.ok:
+            return []
+        items: dict[str, dict[str, str]] = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            name, url, kind = parts[0], parts[1], parts[-1]
+            entry = items.setdefault(
+                name, {"name": name, "fetch_url": "", "push_url": ""}
+            )
+            if kind == "(fetch)":
+                entry["fetch_url"] = url
+            elif kind == "(push)":
+                entry["push_url"] = url
+            elif not entry["fetch_url"]:
+                entry["fetch_url"] = url
+        return list(items.values())
+
     def _list_remotes(self, repo: dict[str, Any]) -> list[str]:
         """读取仓库已配置的 remote 名称。
 
@@ -1183,10 +1241,7 @@ class GitManagerService:
         返回值：
             remote 名称列表；失败时返回空列表。
         """
-        result = self.executor.run(repo["id"], repo["path"], "remote_list", ["remote"])
-        if not result.ok:
-            return []
-        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return [item["name"] for item in self._read_remotes(repo)]
 
     def get_remotes(self, repo_id: int) -> dict[str, Any]:
         """查询仓库已有的 remote 列表（用于推送面板设置上游）。
@@ -1194,11 +1249,15 @@ class GitManagerService:
         参数：
             repo_id: 仓库主键。
         返回值：
-            {"items": ["origin", ...]}。
+            {"items": ["origin", ...], "remotes": [{name, fetch_url, push_url}]}。
         """
         repo = self.get_repo(repo_id)
         self._ensure_repo_dir(repo)
-        return {"items": self._list_remotes(repo)}
+        details = self._read_remotes(repo)
+        return {
+            "items": [item["name"] for item in details],
+            "remotes": details,
+        }
 
     def _record_blocked_force(self, repo: dict[str, Any], reason: str) -> None:
         """记录被拒绝的强制推送请求（未执行任何 git 命令）。
@@ -1361,10 +1420,18 @@ class GitManagerService:
         repo = self.get_repo(repo_id)
         self._ensure_repo_dir(repo)
         parsed = self._collect_dirty(repo)
-        files: list[dict[str, str]] = []
-        for group in ("staged", "modified", "untracked", "conflicts"):
+        files: list[dict[str, Any]] = []
+        for group in ("staged", "modified", "deleted", "untracked", "conflicts"):
             for item in parsed[group]:
-                files.append({"path": item["path"], "code": item["code"], "group": group})
+                files.append(
+                    {
+                        "path": item["path"],
+                        "code": item["code"],
+                        "group": group,
+                        "old_path": item.get("old_path"),
+                        "renamed": bool(item.get("renamed")),
+                    }
+                )
         return {
             "files": files,
             "conflicts": parsed["conflicts"],
@@ -1407,7 +1474,7 @@ class GitManagerService:
 
         # 建立脏文件路径映射（Windows 下忽略大小写），防止路径注入
         allowed: dict[str, str] = {}
-        for group in ("staged", "modified", "untracked"):
+        for group in ("staged", "modified", "deleted", "untracked"):
             for item in parsed[group]:
                 allowed[os.path.normcase(item["path"])] = item["path"]
 
@@ -1430,23 +1497,44 @@ class GitManagerService:
         if not selected:
             raise ApiError("no_files", "请至少勾选一个有效变更文件。", 400)
 
+        # 必须使用 git add -A：已删除/重命名文件只有 -A 才能正确进入暂存区
         add_res = self.executor.run(
-            repo["id"], repo["path"], "stage", ["add", "--", *selected]
+            repo["id"],
+            repo["path"],
+            "stage",
+            [*QUOTEPATH_ARGS, "add", "-A", "--", *selected],
         )
         if not add_res.ok:
-            raise _error_from_result("stage", add_res)
+            raise ApiError(
+                "stage_failed",
+                f"暂存失败（git 退出码 {add_res.exit_code}）：{add_res.command}\n"
+                f"{(add_res.stderr or add_res.stdout).strip()}",
+                409,
+                {
+                    "command": add_res.command,
+                    "exit_code": add_res.exit_code,
+                    "output": (add_res.stderr or add_res.stdout).strip()[-1000:],
+                },
+            )
 
         commit_res = self.executor.run(
             repo["id"],
             repo["path"],
             "commit",
-            ["commit", "-m", clean_message, "--", *selected],
+            [*QUOTEPATH_ARGS, "commit", "-m", clean_message, "--", *selected],
         )
         if not commit_res.ok:
-            lowered = (commit_res.stderr or "").lower()
-            if "nothing to commit" in lowered or "no changes added" in lowered:
-                raise ApiError("no_changes", "所选文件没有可提交的变更。", 409)
-            raise _error_from_result("commit", commit_res)
+            raise ApiError(
+                "commit_failed",
+                f"提交失败（git 退出码 {commit_res.exit_code}）：{commit_res.command}\n"
+                f"{(commit_res.stderr or commit_res.stdout).strip()}",
+                409,
+                {
+                    "command": commit_res.command,
+                    "exit_code": commit_res.exit_code,
+                    "output": (commit_res.stderr or commit_res.stdout).strip()[-1000:],
+                },
+            )
 
         last = self._read_last_commit(repo)
         if last is None:
@@ -1472,13 +1560,66 @@ class GitManagerService:
 
     def query_audit(
         self,
+        page: int,
+        page_size: int,
+        repo_id: int | None,
+        action: str | None,
+        only_failed: bool,
+    ) -> dict[str, Any]:
+        """按页查询审计日志（服务端分页，每页条数固定由 page_size 控制）。
+
+        参数：
+            page: 页码（从 1 开始；越界时自动收敛到最后页）。
+            page_size: 每页条数（1-50）。
+            repo_id: 可选仓库过滤。
+            action: 可选动作过滤。
+            only_failed: 是否只看失败。
+        返回值：
+            {
+              total, total_pages, page, page_size, items,
+              "from"/"to" 为当前页 1-based 记录区间（无记录时为 0）
+            }。
+        """
+        page_size = max(1, min(int(page_size), 50))
+        total, _ = self.database.query_audit(
+            limit=1,
+            offset=0,
+            repo_id=repo_id,
+            action=action,
+            only_failed=only_failed,
+        )
+        total_pages = (total + page_size - 1) // page_size
+        if total_pages == 0:
+            current = 1
+        else:
+            current = max(1, min(int(page), total_pages))
+        offset = (current - 1) * page_size
+        _, items = self.database.query_audit(
+            limit=page_size,
+            offset=offset,
+            repo_id=repo_id,
+            action=action,
+            only_failed=only_failed,
+        )
+        return {
+            "total": total,
+            "total_pages": total_pages,
+            "page": current,
+            "page_size": page_size,
+            "from": offset + 1 if items else 0,
+            "to": offset + len(items) if items else 0,
+            "items": items,
+        }
+
+    def query_audit_legacy(
+        self,
         limit: int,
         offset: int,
         repo_id: int | None,
         action: str | None,
         only_failed: bool,
     ) -> dict[str, Any]:
-        """查询审计日志。
+        """兼容旧版 limit/offset 查询（供既有脚本与旧调用方使用）。
 
         参数：
             limit: 每页条数。

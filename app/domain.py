@@ -16,18 +16,21 @@ def parse_status_porcelain_z(output: str) -> dict[str, Any]:
     """解析 `git status --porcelain=v1 -z` 输出。
 
     参数：
-        output: git 原样输出（NUL 分隔）。
+        output: git 原样输出（NUL 分隔，重命名条目紧跟原路径）。
     返回值：
         {
-          "staged"/"modified"/"untracked"/"conflicts": [{path, code}],
-          "counts": {staged, modified, untracked, conflicts, total}
+          "staged"/"modified"/"deleted"/"untracked"/"conflicts":
+              [{path, code, old_path?, renamed?}],
+          "counts": {staged, modified, deleted, untracked, conflicts, total}
         }；
         其中 total 为去重后的脏文件总数（同一文件可能同时处于 staged 与 modified）。
+        说明：工作区已删除（Y=D）归入 deleted，暂存区已删除（X=D）归入 staged。
     """
-    staged: list[dict[str, str]] = []
-    modified: list[dict[str, str]] = []
-    untracked: list[dict[str, str]] = []
-    conflicts: list[dict[str, str]] = []
+    staged: list[dict[str, Any]] = []
+    modified: list[dict[str, Any]] = []
+    deleted: list[dict[str, Any]] = []
+    untracked: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
     unique_paths: set[str] = set()
 
     tokens = output.split("\x00")
@@ -39,13 +42,18 @@ def parse_status_porcelain_z(output: str) -> dict[str, Any]:
             continue
         x, y = entry[0], entry[1]
         path = entry[3:]
-        # 重命名/复制条目后紧跟原路径，跳过
+        old_path: str | None = None
+        # 重命名/复制条目后紧跟原路径，单独记录后跳过
         if x in ("R", "C") and index < len(tokens):
+            old_path = tokens[index]
             index += 1
         if not path:
             continue
 
-        item = {"path": path, "code": f"{x}{y}"}
+        item: dict[str, Any] = {"path": path, "code": f"{x}{y}"}
+        if old_path:
+            item["old_path"] = old_path
+            item["renamed"] = True
         unique_paths.add(path)
 
         if x == "?":
@@ -55,19 +63,25 @@ def parse_status_porcelain_z(output: str) -> dict[str, Any]:
         elif f"{x}{y}" in _CONFLICT_CODES:
             conflicts.append(item)
         else:
+            # 暂存区变更（含新增、修改、删除、重命名）
             if x != " ":
                 staged.append(item)
-            if y != " " and y in {"M", "D", "T"}:
-                modified.append(item)
+            # 工作区未暂存变更：删除单独成类，修改/类型变化归入 modified
+            if y == "D":
+                deleted.append({**item, "code": f"{x}D"})
+            elif y in {"M", "T", "R", "C"}:
+                modified.append({**item, "code": f"{x}{y}"})
 
     return {
         "staged": staged,
         "modified": modified,
+        "deleted": deleted,
         "untracked": untracked,
         "conflicts": conflicts,
         "counts": {
             "staged": len(staged),
             "modified": len(modified),
+            "deleted": len(deleted),
             "untracked": len(untracked),
             "conflicts": len(conflicts),
             "total": len(unique_paths),

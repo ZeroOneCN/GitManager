@@ -148,6 +148,10 @@ a { color: var(--accent); }
 .btn-danger { background: transparent; color: var(--red); border-color: #f0c9ce; }
 .btn-danger:hover:not(:disabled) { background: var(--red-weak); }
 
+/* 危险操作用语义红实心主按钮 */
+.btn-danger-solid { background: var(--red); color: #ffffff; border-color: var(--red); }
+.btn-danger-solid:hover:not(:disabled) { background: #c9343b; }
+
 .btn-sm { padding: 4px 10px; font-size: 12px; border-radius: 999px; gap: 4px; }
 .btn-link { border: 0; background: none; color: var(--accent); padding: 0; font-size: 12px; font-weight: 500; }
 .btn-link:hover:not(:disabled) { text-decoration: underline; }
@@ -250,7 +254,8 @@ a { color: var(--accent); }
 .identity-label { color: var(--muted); }
 .identity-name { color: var(--text-2); font-weight: 500; }
 .identity-sep { color: var(--muted-2); }
-.identity-strip .btn-link { margin-left: auto; }
+.identity-strip #identity-manage { margin-left: auto; }
+.identity-strip .service-url { flex: none; }
 .badge.source-default { color: var(--accent); background: var(--accent-weak); border-color: transparent; }
 
 /* ---------------- 仓库卡片 ---------------- */
@@ -315,9 +320,8 @@ a { color: var(--accent); }
   font-family: var(--mono);
   font-size: 11px;
   color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .stat-row {
@@ -371,6 +375,8 @@ a { color: var(--accent); }
 .chip.is-staged .dot { background: var(--green); }
 .chip.is-modified { background: var(--amber-weak); color: var(--amber); }
 .chip.is-modified .dot { background: var(--amber); }
+.chip.is-deleted { background: var(--red-weak); color: var(--red); }
+.chip.is-deleted .dot { background: var(--red); }
 .chip.is-untracked { background: var(--accent-weak); color: var(--accent); }
 .chip.is-untracked .dot { background: var(--accent); }
 .chip.is-conflict { background: var(--red-weak); color: var(--red); }
@@ -427,7 +433,8 @@ a { color: var(--accent); }
   color: var(--muted);
 }
 .file-code.code-conflict { background: var(--red-weak); color: var(--red); }
-.file-path { font-family: var(--mono); color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-code.code-deleted { background: var(--red-weak); color: var(--red); }
+.file-path { font-family: var(--mono); color: var(--text-2); white-space: normal; overflow-wrap: anywhere; }
 
 .commit-block {
   margin-top: 12px;
@@ -618,7 +625,40 @@ a { color: var(--accent); }
   flex-wrap: wrap;
 }
 .muted { color: var(--muted); font-size: 12px; }
-.pager { display: flex; gap: 8px; }
+.pager { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.pager-jump { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.pager-input {
+  width: 58px;
+  height: 30px;
+  padding: 0 8px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.selection-hint { margin-top: 8px; font-size: 12px; color: var(--red); }
+.full-text {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.service-url { color: var(--text); font-weight: 500; }
+.remote-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11.5px;
+}
+.remote-line .label {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+  padding-top: 1px;
+}
+.remote-line .full-text { flex: 1; min-width: 0; }
+.remote-list { margin-top: 8px; }
 
 /* ---------------- 弹窗 ---------------- */
 
@@ -638,8 +678,9 @@ a { color: var(--accent); }
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 
 .modal {
-  width: min(680px, 94vw);
-  max-height: 88vh;
+  width: min(420px, calc(100vw - 32px));
+  max-width: 480px;
+  max-height: 84vh;
   display: flex;
   flex-direction: column;
   background: var(--surface);
@@ -648,29 +689,45 @@ a { color: var(--accent); }
   overflow: hidden;
   animation: fade 0.2s ease-out;
 }
-.modal.modal-wide { width: min(920px, 96vw); }
+.modal.modal-wide { width: min(480px, calc(100vw - 32px)); }
 
 .modal-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 17px 22px;
+  padding: 14px 22px;
   border-bottom: 1px solid var(--border);
   flex: none;
 }
-.modal-head h2 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
-.modal-body { padding: 20px 22px; overflow: auto; flex: 1; scrollbar-gutter: stable; }
+.modal-head h2 { margin: 0; font-size: 15.5px; font-weight: 600; letter-spacing: -0.01em; }
+.modal-body {
+  padding: 20px 22px;
+  overflow: auto;
+  flex: 1;
+  max-height: 60vh;
+  font-size: 13.5px;
+  scrollbar-gutter: stable;
+}
 .modal-foot {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  padding: 14px 22px;
+  padding: 12px 20px;
   border-top: 1px solid var(--border);
   background: var(--surface-2);
   flex: none;
   flex-wrap: wrap;
 }
+.modal-foot .btn { height: 34px; padding: 0 16px; }
 .modal-foot:empty { display: none; }
+
+/* 确认层位于业务弹窗之上，独立焦点与遮罩 */
+.confirm-backdrop { z-index: 70; }
+.confirm-modal { width: min(400px, calc(100vw - 32px)); }
+.confirm-text { margin: 0; line-height: 1.65; color: var(--text-2); }
+
+/* 打开弹窗时锁定背景滚动（滚动条槽位保持稳定，避免宽度跳动） */
+body.modal-open .app-main { overflow: hidden; }
 
 .form-section + .form-section { margin-top: 20px; }
 .repo-reference {
@@ -704,9 +761,9 @@ a { color: var(--accent); }
 .commit-group + .commit-group { margin-top: 8px; }
 .commit-group-title { display: flex; align-items: center; justify-content: space-between; padding: 4px 6px; }
 .commit-group-title .title { font-size: 11px; font-weight: 500; color: var(--muted); }
-.commit-file { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px; }
+.commit-file { display: flex; align-items: flex-start; gap: 8px; padding: 5px 6px; border-radius: 6px; }
 .commit-file:hover { background: var(--surface-2); }
-.commit-file .path { font-family: var(--mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.commit-file .path { font-family: var(--mono); font-size: 11.5px; white-space: normal; overflow-wrap: anywhere; }
 .commit-file .code { flex: none; font-family: var(--mono); font-size: 10px; font-weight: 500; padding: 1px 5px; border-radius: 4px; background: var(--surface-3); color: var(--muted); }
 .commit-file .code.is-conflict { background: var(--red-weak); color: var(--red); }
 .commit-toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; gap: 10px; }
@@ -808,7 +865,7 @@ a { color: var(--accent); }
   font-size: 11px;
   color: var(--accent);
 }
-.selected-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.selected-chip span { white-space: normal; overflow-wrap: anywhere; }
 .selected-chip button { border: 0; background: none; color: var(--muted); padding: 0 1px; font-size: 13px; line-height: 1; }
 .selected-chip button:hover { color: var(--red); }
 
@@ -831,7 +888,7 @@ a { color: var(--accent); }
 .root-list { display: flex; flex-direction: column; gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
 .root-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; background: var(--surface); }
 .root-row-main { min-width: 0; }
-.root-row-path { font-family: var(--mono); font-size: 12px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.root-row-path { font-family: var(--mono); font-size: 12px; color: var(--text-2); white-space: normal; overflow-wrap: anywhere; }
 .root-row-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .inline-form { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
 .inline-form .input { flex: 1; min-width: 220px; }
@@ -862,7 +919,7 @@ a { color: var(--accent); }
 .scan-table tr.is-managed { color: var(--muted); background: var(--surface-2); }
 .scan-table tr.is-managed .scan-name { color: var(--muted); font-weight: 500; }
 .scan-name { font-weight: 600; font-size: 12.5px; }
-.scan-path { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 520px; }
+.scan-path { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-top: 1px; white-space: normal; overflow-wrap: anywhere; }
 .cell-check { width: 34px; text-align: center; }
 .cell-check input { accent-color: var(--accent); width: 14px; height: 14px; margin: 0; }
 
@@ -889,7 +946,7 @@ a { color: var(--accent); }
 .ssh-row-main { min-width: 0; flex: 1; }
 .ssh-row-title { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 12.5px; }
 .ssh-name { font-weight: 600; }
-.ssh-row-meta { margin-top: 2px; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ssh-row-meta { margin-top: 2px; font-size: 11px; color: var(--muted); white-space: normal; overflow-wrap: anywhere; }
 .ssh-row-actions { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; flex: none; }
 .ssh-form { margin-top: 20px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
 .ssh-form-title { font-size: 12.5px; font-weight: 600; margin-bottom: 10px; }
