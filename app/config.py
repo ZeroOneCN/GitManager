@@ -211,6 +211,50 @@ def _ensure_access_token(env_path: Path, lan_enabled: bool) -> str:
     return token
 
 
+def _strip_trailing_separator(text: str) -> str:
+    """去除路径末尾多余的目录分隔符（保留盘符根目录）。
+
+    参数：
+        text: 绝对路径文本。
+    返回值：
+        去掉末尾 "\\" 或 "/" 的路径；"E:\\" 这类盘符根保持不变。
+    """
+    trimmed = text.rstrip("\\/")
+    if not trimmed:
+        return text
+    if os.name == "nt" and len(trimmed) == 2 and trimmed[1] == ":":
+        return trimmed + os.sep
+    return trimmed
+
+
+def normalize_repo_path(path: str | os.PathLike[str]) -> str:
+    """规范化仓库路径：解析真实路径并去掉尾部分隔符。
+
+    参数：
+        path: 用户输入或数据库中的路径文本（可含引号、环境变量、.. 或符号链接）。
+    返回值：
+        可入库与比对的真实绝对路径（保留磁盘上的真实大小写）。
+    """
+    text = os.path.expandvars(str(path).strip().strip('"'))
+    try:
+        real = os.path.realpath(text)
+    except OSError:
+        real = os.path.abspath(text)
+    return _strip_trailing_separator(real)
+
+
+def repo_path_key(path: str | os.PathLike[str]) -> str:
+    """生成用于去重比对的路径键（Windows 下大小写不敏感）。
+
+    参数：
+        path: 任意写法的路径文本。
+    返回值：
+        规范化后（Windows 下再 casefold）的字符串，供集合与数据库比对使用。
+    """
+    normalized = normalize_repo_path(path)
+    return normalized.casefold() if os.name == "nt" else normalized
+
+
 def path_is_under(path: Path, roots: tuple[Path, ...] | list[Path]) -> bool:
     """判断路径是否位于任一允许根目录之下（Windows 大小写不敏感）。
 

@@ -91,8 +91,16 @@ async def lifespan(_: FastAPI):
         settings.host,
         settings.port,
         "、".join(str(root) for root in roots),
-        purged,
+        purged["purged"],
     )
+    if purged["normalized"]:
+        logger.info("仓库路径规范化：改写 %s 条记录的入库路径", purged["normalized"])
+    if purged["duplicates"]:
+        logger.warning(
+            "仓库去重自查：%s 条历史重复记录已标记为 duplicate_of（保留最早创建的一条，"
+            "数据未删除，仅从列表隐藏）",
+            purged["duplicates"],
+        )
     urls = build_access_urls(settings.host, settings.port)
     logger.info("可访问地址：%s", "  ".join(urls))
     if settings.lan_enabled:
@@ -488,26 +496,47 @@ def get_settings() -> dict[str, Any]:
 
 @app.get("/api/repos")
 def list_repos() -> dict[str, Any]:
-    """列出已配置仓库。
+    """列出已配置仓库，并回报启动自查的去重处理数量。
 
     参数：
         无。
     返回值：
-        {"items": [...]}。
+        {"items": [...], "duplicates_marked": n, "paths_normalized": n}。
+        duplicates_marked 为历史重复记录被标记隐藏的条数（数据未删除）。
     """
-    return {"items": service.list_repositories()}
+    return {
+        "items": service.list_repositories(),
+        "duplicates_marked": int(database.last_repair.get("duplicates", 0)),
+        "paths_normalized": int(database.last_repair.get("normalized", 0)),
+    }
 
 
 @app.post("/api/repos")
 def add_repos(payload: AddReposRequest) -> dict[str, Any]:
-    """批量添加本地仓库。
+    """批量添加本地仓库（单条重复时返回 409，批量时静默跳过）。
 
     参数：
         payload: 路径列表。
     返回值：
-        逐条添加结果与新增数量。
+        逐条添加结果、新增数量与跳过明细。
+    异常：
+        ApiError: 单条添加命中已存在的仓库时返回 409 already_exists。
     """
-    return service.add_repositories(payload.paths)
+    result = service.add_repositories(payload.paths)
+    if len(payload.paths) == 1:
+        item = result["results"][0] if result["results"] else {}
+        if item.get("duplicate"):
+            raise ApiError(
+                "already_exists",
+                f"该仓库已在列表中：{item.get('name') or item.get('path')}",
+                409,
+                {
+                    "repo_id": item.get("repo_id"),
+                    "name": item.get("name"),
+                    "path": item.get("path"),
+                },
+            )
+    return result
 
 
 @app.delete("/api/repos/{repo_id}")

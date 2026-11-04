@@ -410,12 +410,12 @@ def main() -> int:
             print(f"已保留临时数据：{test_root}；数据库：{selftest_db}")
             return
         # 目录联接需先单独移除，避免 rmtree 在 Windows 上留下残留
-        junction_dir = test_root / "scanroot" / "loop"
-        if junction_dir.exists():
-            try:
-                os.rmdir(junction_dir)
-            except OSError:
-                pass
+        for link_dir in (test_root / "scanroot" / "loop", test_root / "work-link"):
+            if link_dir.exists():
+                try:
+                    os.rmdir(link_dir)
+                except OSError:
+                    pass
         # Windows 上服务退出后可能存在短暂文件句柄残留，多次重试删除
         time.sleep(0.5)
         force_rmtree(test_root)
@@ -712,12 +712,77 @@ def main() -> int:
         )
 
         status, dup = http_call("POST", base, "/api/repos", {"paths": [str(work_dir)]})
-        dup_result = ((dup or {}).get("results") or [{}])[0]
         check(
-            "重复添加给出幂等提示",
-            status == 200 and dup_result.get("ok") is True and dup_result.get("duplicate") is True,
-            json.dumps(dup_result, ensure_ascii=False),
+            "重复添加单条路径返回 409 already_exists",
+            status == 409
+            and (dup or {}).get("code") == "already_exists"
+            and int((dup or {}).get("repo_id") or 0) == work_id
+            and bool((dup or {}).get("name")),
+            json.dumps(dup, ensure_ascii=False),
         )
+
+        # 同一仓库的多种书写方式（大小写、尾斜杠、含 .. 的相对段）都应命中同一条记录
+        variants = [
+            ("大小写差异", str(work_dir).upper()),
+            ("尾部分隔符", str(work_dir) + os.sep),
+            ("含 .. 的路径段", str(work_dir / ".." / work_dir.name)),
+        ]
+        variant_status: list[tuple[str, int, str]] = []
+        for label, variant_path in variants:
+            status, dup_variant = http_call(
+                "POST", base, "/api/repos", {"paths": [variant_path]}
+            )
+            variant_status.append(
+                (label, status, str((dup_variant or {}).get("code") or ""))
+            )
+        check(
+            "大小写/尾斜杠/.. 写法均判定为同一仓库并返回 409",
+            all(
+                status == 409 and code == "already_exists"
+                for _, status, code in variant_status
+            ),
+            json.dumps(variant_status, ensure_ascii=False),
+        )
+        status, repos_after_variants = http_call("GET", base, "/api/repos")
+        work_key = os.path.normcase(os.path.realpath(str(work_dir)))
+        work_records = [
+            item
+            for item in (repos_after_variants or {}).get("items", [])
+            if os.path.normcase(os.path.realpath(item.get("path", ""))) == work_key
+        ]
+        check(
+            "不同写法重复添加后仅保留一条记录",
+            status == 200 and len(work_records) == 1,
+            f"matched={len(work_records)}",
+        )
+
+        # 目录联接（junction）指向同一仓库时也应判定为同一条
+        work_link = test_root / "work-link"
+        link_result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(work_link), str(work_dir)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+        )
+        if link_result.returncode == 0 and work_link.exists():
+            status, link_dup = http_call(
+                "POST", base, "/api/repos", {"paths": [str(work_link)]}
+            )
+            check(
+                "目录联接指向同一仓库时判定为同一条（409）",
+                status == 409
+                and (link_dup or {}).get("code") == "already_exists"
+                and int((link_dup or {}).get("repo_id") or 0) == work_id,
+                json.dumps(link_dup, ensure_ascii=False),
+            )
+        else:
+            check(
+                "目录联接指向同一仓库时判定为同一条（409）",
+                True,
+                f"环境不支持目录联接，已跳过：{(link_result.stderr or '').strip()[:80]}",
+            )
 
         status, rejected = http_call("POST", base, "/api/repos", {"paths": ["C:\\Windows"]})
         rejected_result = ((rejected or {}).get("results") or [{}])[0]
@@ -1590,6 +1655,7 @@ def main() -> int:
         # ---------- 13. 仓库扫描（只读、跳过噪音、深度与结果上限） ----------
         make_repo(scan_root / "repo-a")
         make_repo(scan_root / "group" / "repo-b")
+        make_repo(scan_root / "group" / "repo-c")
         make_repo(scan_root / "node_modules" / "noise-repo")
         make_repo(scan_root / ".venv" / "noise-repo2")
         make_repo(scan_root / "deep" / "a" / "b" / "repo-deep")
@@ -1659,7 +1725,7 @@ def main() -> int:
             "扫描结果包含当前分支且标记未管理",
             repo_a_item.get("branch") == "main"
             and repo_a_item.get("detached") is False
-            and repo_a_item.get("managed") is False,
+            and repo_a_item.get("already_managed") is False,
             str(repo_a_item),
         )
 
@@ -1728,6 +1794,38 @@ def main() -> int:
             rescan_snapshot.get("status") == "done"
             and int(rescan_snapshot.get("managed_count") or 0) >= 2,
             f"managed_count={rescan_snapshot.get('managed_count')}",
+        )
+        rescan_items = rescan_snapshot.get("items") or []
+        rescan_repo_a = next(
+            (item for item in rescan_items if os.path.normcase(item.get("path", "")) == repo_a_path),
+            {},
+        )
+        check(
+            "扫描结果每项都带 already_managed 标记（已管理项为 true）",
+            bool(rescan_items)
+            and all("already_managed" in item for item in rescan_items)
+            and rescan_repo_a.get("already_managed") is True,
+            f"items={len(rescan_items)} repo_a={rescan_repo_a.get('already_managed')}",
+        )
+        status, batch_skip = http_call(
+            "POST",
+            base,
+            "/api/repos",
+            {"paths": [str(scan_root / "group" / "repo-c"), str(scan_root / "repo-a")]},
+        )
+        batch_skip = batch_skip or {}
+        skip_items = batch_skip.get("skipped") or []
+        check(
+            "批量添加跳过已存在并给出正确计数",
+            status == 200
+            and batch_skip.get("added") == 1
+            and len(skip_items) == 1
+            and skip_items[0].get("reason") == "already_exists"
+            and int(skip_items[0].get("repo_id") or 0) == repo_a_id,
+            json.dumps(
+                {"added": batch_skip.get("added"), "skipped": skip_items},
+                ensure_ascii=False,
+            )[:300],
         )
 
         # ---------- 15. 多根白名单管理 ----------

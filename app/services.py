@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .config import Settings, path_is_under
+from .config import Settings, normalize_repo_path, path_is_under
 from .db import Database, now_iso
 from .domain import (
     classify_remote_error,
@@ -609,14 +609,19 @@ class GitManagerService:
         return self.ssh.resolve_for_repo(int(repo["id"]))
 
     def add_repositories(self, raw_paths: list[str]) -> dict[str, Any]:
-        """批量添加仓库（逐条校验，允许部分成功）。
+        """批量添加仓库（逐条校验，允许部分成功；已存在的规范化路径静默跳过）。
 
         参数：
             raw_paths: 用户提交的路径字符串列表（最多 500 条）。
         返回值：
-            {"results": [{path, ok, repo_id?, name?, error?, duplicate?}], "added": n}。
+            {
+              "results": [{path, ok, repo_id?, name?, error?, duplicate?, message?}],
+              "added": 新增条数,
+              "skipped": [{path, reason, repo_id?, name?}]（已存在被跳过的条目）
+            }。
         """
         results: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
         added = 0
         allowed_roots = self.allowed_root_paths()
         for raw in raw_paths[:500]:
@@ -638,7 +643,7 @@ class GitManagerService:
                 )
                 continue
             try:
-                resolved = candidate.resolve()
+                resolved = Path(normalize_repo_path(candidate))
             except OSError as exc:
                 results.append(
                     {"path": text, "ok": False, "error": f"路径无法解析：{exc}"}
@@ -673,7 +678,7 @@ class GitManagerService:
                 )
                 continue
 
-            top_level = Path(detect.stdout.strip()).resolve()
+            top_level = Path(normalize_repo_path(detect.stdout.strip()))
             if not path_is_under(top_level, allowed_roots):
                 results.append(
                     {
@@ -714,11 +719,41 @@ class GitManagerService:
                         "message": "该仓库已在列表中。",
                     }
                 )
+                skipped.append(
+                    {
+                        "path": str(top_level),
+                        "reason": "already_exists",
+                        "repo_id": existing["id"],
+                        "name": existing["name"],
+                    }
+                )
                 continue
 
             try:
                 repo_id = self.database.insert_repo(str(top_level), top_level.name)
             except sqlite3.IntegrityError:
+                # 并发写入或路径键唯一约束命中：同样按已存在处理，避免重复记录
+                current = self.database.find_repo_by_path(str(top_level))
+                if current:
+                    results.append(
+                        {
+                            "path": str(top_level),
+                            "ok": True,
+                            "duplicate": True,
+                            "repo_id": current["id"],
+                            "name": current["name"],
+                            "message": "该仓库已在列表中。",
+                        }
+                    )
+                    skipped.append(
+                        {
+                            "path": str(top_level),
+                            "reason": "already_exists",
+                            "repo_id": current["id"],
+                            "name": current["name"],
+                        }
+                    )
+                    continue
                 results.append(
                     {
                         "path": str(top_level),
@@ -738,7 +773,12 @@ class GitManagerService:
                     "message": "添加成功。",
                 }
             )
-        return {"results": results, "added": added}
+        return {
+            "results": results,
+            "added": added,
+            "skipped": skipped,
+            "skipped_count": len(skipped),
+        }
 
     def remove_repository(self, repo_id: int) -> dict[str, Any]:
         """移除仓库配置（绝不删除磁盘目录）。

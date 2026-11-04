@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .config import Settings
+from .config import Settings, normalize_repo_path, repo_path_key
 from .db import Database, now_iso
 
 
@@ -52,7 +52,7 @@ class ScanManager:
             任务快照（含 job_id 与初始状态）。
         """
         job_id = uuid.uuid4().hex[:12]
-        managed = {os.path.normcase(repo["path"]) for repo in self.database.list_repos()}
+        managed = {repo_path_key(repo["path"]) for repo in self.database.list_repos()}
         job: dict[str, Any] = {
             "job_id": job_id,
             "status": "running",
@@ -174,16 +174,19 @@ class ScanManager:
 
                 if _is_git_worktree(current):
                     branch, detached = _read_branch(current)
+                    item_path = normalize_repo_path(current)
                     item = {
-                        "path": str(current),
+                        "path": item_path,
                         "name": current.name or str(current),
                         "branch": branch,
                         "detached": detached,
-                        "managed": os.path.normcase(str(current)) in managed,
+                        "already_managed": repo_path_key(item_path) in managed,
                     }
                     job["items"].append(item)
                     job["found"] += 1
-                    job["managed_count"] = sum(1 for entry in job["items"] if entry["managed"])
+                    job["managed_count"] = sum(
+                        1 for entry in job["items"] if entry["already_managed"]
+                    )
                     if job["found"] >= limit:
                         job["truncated"] = True
                         job["status"] = "done"

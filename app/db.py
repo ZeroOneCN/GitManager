@@ -13,12 +13,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .config import normalize_repo_path, repo_path_key
+
 # 建表语句：幂等执行
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS repositories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     path TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
+    path_key TEXT,
+    duplicate_of INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 
@@ -108,6 +112,12 @@ class Database:
         """
         self.path = Path(path)
         self._write_lock = threading.Lock()
+        # 最近一次启动自查的统计（供列表接口回报去重处理数量）
+        self.last_repair: dict[str, int] = {
+            "purged": 0,
+            "normalized": 0,
+            "duplicates": 0,
+        }
 
     def _connect(self) -> sqlite3.Connection:
         """创建新的数据库连接。
@@ -122,14 +132,15 @@ class Database:
         conn.execute("PRAGMA busy_timeout = 15000")
         return conn
 
-    def init(self, retention_days: int, default_roots: tuple[Path, ...] = ()) -> int:
-        """初始化数据库：建目录、建表、迁移审计列、种子白名单，并清理超期审计。
+    def init(self, retention_days: int, default_roots: tuple[Path, ...] = ()) -> dict[str, int]:
+        """初始化数据库：建目录、建表、迁移审计列、规范化仓库路径，并清理超期审计。
 
         参数：
             retention_days: 审计日志保留天数。
             default_roots: 首次初始化时从 .env 导入的默认白名单根目录。
         返回值：
-            本次清理删除的审计行数。
+            {"purged": 清理的审计行数, "normalized": 规范化路径条数,
+             "duplicates": 标记为重复的仓库条数}。
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._write_lock, self._connect() as conn:
@@ -144,16 +155,114 @@ class Database:
                 conn.execute(
                     "ALTER TABLE audit_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''"
                 )
+            # 兼容旧数据库：补充仓库路径键与重复标记列，并做一次路径规范化自查
+            repo_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(repositories)")
+            }
+            if "path_key" not in repo_columns:
+                conn.execute("ALTER TABLE repositories ADD COLUMN path_key TEXT")
+            if "duplicate_of" not in repo_columns:
+                conn.execute(
+                    "ALTER TABLE repositories ADD COLUMN duplicate_of INTEGER NOT NULL DEFAULT 0"
+                )
+            repair = self._repair_repo_paths(conn)
         if default_roots and not self.list_allowed_roots():
             for root in default_roots:
                 try:
                     self.insert_allowed_root(str(root))
                 except sqlite3.IntegrityError:
                     continue
-        return self.purge_audit(retention_days)
+        purged = self.purge_audit(retention_days)
+        self.last_repair = {"purged": purged, **repair}
+        return self.last_repair
+
+    def _repair_repo_paths(self, conn: sqlite3.Connection) -> dict[str, int]:
+        """启动自查：规范化历史仓库路径并标记重复记录（不删除任何数据）。
+
+        参数：
+            conn: 已打开的数据库连接（调用方需持有写锁）。
+        返回值：
+            {"normalized": 路径被改写的条数, "duplicates": 新标记为重复的条数}。
+        说明：
+            同一规范化路径（Windows 大小写不敏感）只保留创建最早的一条；
+            其余记录写入 duplicate_of 指向保留记录并从列表隐藏，原始数据保留可追溯。
+        """
+        rows = conn.execute(
+            """
+            SELECT id, path, created_at, path_key, duplicate_of
+            FROM repositories ORDER BY id ASC
+            """
+        ).fetchall()
+        all_ids = {int(row["id"]) for row in rows}
+        active_rows: list[dict[str, Any]] = []
+        for row in rows:
+            keeper = int(row["duplicate_of"] or 0)
+            if keeper and keeper in all_ids:
+                # 已有重复标记且保留记录仍在：维持隐藏状态，不重复计算
+                continue
+            if keeper:
+                # 原保留记录已被删除：解除标记，让该记录重新参与列表与去重
+                conn.execute("UPDATE repositories SET duplicate_of = 0 WHERE id = ?", (row["id"],))
+            path_text = normalize_repo_path(row["path"])
+            active_rows.append(
+                {
+                    "id": int(row["id"]),
+                    "raw": row["path"],
+                    "path_text": path_text,
+                    "created_at": row["created_at"],
+                    "key": repo_path_key(path_text),
+                }
+            )
+
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for item in active_rows:
+            groups.setdefault(item["key"], []).append(item)
+        duplicates = 0
+        keepers: list[dict[str, Any]] = []
+        for entries in groups.values():
+            entries.sort(key=lambda item: (item["created_at"], item["id"]))
+            keepers.append(entries[0])
+            if len(entries) < 2:
+                continue
+            keeper_id = entries[0]["id"]
+            for item in entries[1:]:
+                # 先标记隐藏并清空路径键，避免同一路径键写库时触发唯一约束
+                conn.execute(
+                    "UPDATE repositories SET duplicate_of = ?, path_key = NULL WHERE id = ?",
+                    (keeper_id, item["id"]),
+                )
+                duplicates += 1
+
+        # 再规范化保留记录的路径并写入路径键；极端情况下若与历史原始路径的
+        # UNIQUE(path) 冲突，仅保留路径键（比较仍然正确），不中断启动
+        normalized = 0
+        for item in keepers:
+            if item["path_text"] != item["raw"]:
+                try:
+                    conn.execute(
+                        "UPDATE repositories SET path = ?, path_key = ? WHERE id = ?",
+                        (item["path_text"], item["key"], item["id"]),
+                    )
+                    normalized += 1
+                    continue
+                except sqlite3.IntegrityError:
+                    pass
+            conn.execute(
+                "UPDATE repositories SET path_key = ? WHERE id = ?",
+                (item["key"], item["id"]),
+            )
+
+        # 部分唯一索引：path_key 为空的隐藏重复记录不受约束，活跃仓库路径键唯一
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_path_key
+                ON repositories(path_key) WHERE path_key IS NOT NULL
+            """
+        )
+        return {"normalized": normalized, "duplicates": duplicates}
 
     def list_repos(self) -> list[dict[str, Any]]:
-        """列出全部已配置仓库。
+        """列出全部生效的已配置仓库（隐藏被标记的历史重复记录）。
 
         参数：
             无。
@@ -162,54 +271,64 @@ class Database:
         """
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, name, path, created_at FROM repositories ORDER BY id ASC"
+                """
+                SELECT id, name, path, created_at FROM repositories
+                WHERE duplicate_of = 0 ORDER BY id ASC
+                """
             ).fetchall()
         return [dict(row) for row in rows]
 
     def get_repo(self, repo_id: int) -> dict[str, Any] | None:
-        """按 id 查询仓库。
+        """按 id 查询生效的仓库。
 
         参数：
             repo_id: 仓库主键。
         返回值：
-            仓库字典；不存在时返回 None。
+            仓库字典；不存在或已被标记为重复时返回 None。
         """
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT id, name, path, created_at FROM repositories WHERE id = ?",
+                """
+                SELECT id, name, path, created_at FROM repositories
+                WHERE id = ? AND duplicate_of = 0
+                """,
                 (repo_id,),
             ).fetchone()
         return dict(row) if row else None
 
     def find_repo_by_path(self, path: str) -> dict[str, Any] | None:
-        """按路径查找仓库（Windows 下忽略大小写）。
+        """按规范化路径查找仓库（Windows 下大小写不敏感）。
 
         参数：
-            path: 仓库绝对路径。
+            path: 仓库路径（任意写法，内部会 realpath 规范化）。
         返回值：
             已存在的仓库字典；未找到返回 None。
         """
-        target = path.lower()
+        target = repo_path_key(path)
         for repo in self.list_repos():
-            if repo["path"].lower() == target:
+            if repo_path_key(repo["path"]) == target:
                 return repo
         return None
 
     def insert_repo(self, path: str, name: str) -> int:
-        """新增仓库配置。
+        """新增仓库配置（持久化规范化路径与去重键）。
 
         参数：
-            path: 仓库根目录绝对路径（唯一）。
+            path: 仓库根目录绝对路径（入库前统一 realpath 规范化）。
             name: 展示名称（目录名）。
         返回值：
             新记录的 id。
         异常：
-            sqlite3.IntegrityError: 路径已存在时抛出（由业务层先行判重）。
+            sqlite3.IntegrityError: 规范化路径已存在时抛出（由业务层先行判重）。
         """
+        path_text = normalize_repo_path(path)
         with self._write_lock, self._connect() as conn:
             cursor = conn.execute(
-                "INSERT INTO repositories(path, name, created_at) VALUES (?, ?, ?)",
-                (path, name, now_iso()),
+                """
+                INSERT INTO repositories(path, name, path_key, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (path_text, name, repo_path_key(path_text), now_iso()),
             )
             return int(cursor.lastrowid)
 

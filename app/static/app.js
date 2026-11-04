@@ -30,6 +30,7 @@
     roots: null,
     ssh: null,
     sshDraft: { editingId: null, testOutput: null },
+    dedupNotified: false,
   };
 
   // 全局禁用原生对话框：所有确认/提示一律走自研 Modal。
@@ -316,6 +317,15 @@
     try {
       const data = await api('/api/repos');
       state.repos = data.items || [];
+      // 启动自查曾标记隐藏历史重复记录：只在首次加载时提示，说明数据未删除
+      if (!state.dedupNotified && Number(data.duplicates_marked || 0) > 0) {
+        state.dedupNotified = true;
+        toast(
+          `启动自查发现 ${data.duplicates_marked} 条历史重复仓库记录，已按最早创建保留一条并隐藏其余（数据未删除）。`,
+          'warn',
+          7000,
+        );
+      }
       for (const id of Array.from(state.statuses.keys())) {
         if (!state.repos.some((repo) => repo.id === id)) state.statuses.delete(id);
       }
@@ -1505,17 +1515,35 @@
     clearModalError();
     try {
       const result = await api('/api/repos', { method: 'POST', body: { paths } });
-      renderAddResults(result);
       const added = result.added || 0;
+      const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
       const failed = (result.results || []).filter((item) => !item.ok).length;
-      if (added > 0) {
-        toast(`已添加 ${added} 个仓库${failed ? `，${failed} 条失败` : ''}。`, failed ? 'warn' : 'success');
-        await loadRepos();
-        refreshAll(true);
+      if (added > 0 || skipped > 0) {
+        renderAddResults(result);
+        const parts = [`新增 ${added} 个`];
+        if (skipped > 0) parts.push(`跳过 ${skipped} 个（已存在）`);
+        if (failed > 0) parts.push(`${failed} 条失败`);
+        toast(`${parts.join('，')}。`, failed ? 'warn' : 'success');
+        if (added > 0) {
+          await loadRepos();
+          refreshAll(true);
+        }
       } else {
+        renderAddResults(result);
         toast(failed ? '没有新增仓库，请查看失败原因。' : '没有新的仓库。', failed ? 'warn' : 'info');
       }
     } catch (err) {
+      const payload = err.payload || {};
+      if (payload.code === 'already_exists') {
+        const label = payload.name ? `「${payload.name}」` : '';
+        await confirmDialog({
+          title: '该仓库已在列表中',
+          message: `该仓库已在列表中${label}，未新增重复记录。\n${payload.path || ''}`,
+          confirmLabel: '知道了',
+        });
+        busyButton(submitBtn, false);
+        return;
+      }
       showModalError(`添加失败：${err.message}`);
       busyButton(submitBtn, false);
     }
@@ -1524,7 +1552,7 @@
   function renderAddResults(result) {
     const items = result.results || [];
     const list = items.map((item) => `<div class="result-item ${item.ok ? 'ok' : 'fail'}">
-      <span class="mark">${item.ok ? '成功' : '失败'}</span>
+      <span class="mark">${item.duplicate ? '已存在' : (item.ok ? '成功' : '失败')}</span>
       <div>
         <div class="path">${escapeHtml(item.path)}</div>
         <div class="msg">${escapeHtml(item.message || item.error || '')}</div>
@@ -1741,21 +1769,22 @@
     }
 
     const items = (job && job.items) || [];
-    const addable = items.filter((item) => !item.managed);
+    const managedCount = items.filter((item) => item.already_managed).length;
+    const addable = items.filter((item) => !item.already_managed);
     const rows = items.length
       ? items.map((item) => {
         const checked = scan.selected.has(item.path);
-        return `<tr class="${item.managed ? 'is-managed' : ''}">
-          <td class="cell-check"><input type="checkbox" data-scan-pick="${escapeHtml(item.path)}" ${item.managed ? 'disabled' : ''} ${checked ? 'checked' : ''}></td>
+        return `<tr class="${item.already_managed ? 'is-managed' : ''}">
+          <td class="cell-check"><input type="checkbox" data-scan-pick="${escapeHtml(item.path)}" ${item.already_managed ? 'disabled' : ''} ${checked ? 'checked' : ''}></td>
           <td><div class="scan-name">${escapeHtml(item.name)}</div><div class="scan-path" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</div></td>
           <td><span class="pill pill-branch">${escapeHtml(item.branch || (item.detached ? 'detached' : '无提交'))}</span></td>
-          <td>${item.managed ? '<span class="badge ok">已在管理</span>' : '<span class="badge neutral">未添加</span>'}</td>
+          <td>${item.already_managed ? '<span class="badge ok">已在管理</span>' : '<span class="badge neutral">未添加</span>'}</td>
         </tr>`;
       }).join('')
       : (job && job.status !== 'running' ? '<tr><td colspan="4"><div class="dir-empty">没有发现 Git 仓库。</div></td></tr>' : '');
 
     const table = job ? `<div class="scan-result-head">
-        <span>扫描结果（${items.length}${job.truncated ? '+ / 已截断' : ''}）</span>
+        <span>扫描结果（共 ${items.length} 个 / 已在列表 ${managedCount} 个${job.truncated ? ' / 已截断' : ''}）</span>
         <div class="scan-result-actions">
           <button class="btn-link" id="scan-select-all" ${addable.length ? '' : 'disabled'}>全选可添加</button>
           <button class="btn-link" id="scan-invert" ${addable.length ? '' : 'disabled'}>反选</button>
@@ -1801,7 +1830,7 @@
     const selectAll = document.getElementById('scan-select-all');
     if (selectAll) {
       selectAll.addEventListener('click', () => {
-        (scan.job.items || []).filter((item) => !item.managed).forEach((item) => scan.selected.add(item.path));
+        (scan.job.items || []).filter((item) => !item.already_managed).forEach((item) => scan.selected.add(item.path));
         renderScan();
       });
     }
@@ -1809,7 +1838,7 @@
     if (invert) {
       invert.addEventListener('click', () => {
         const next = new Set();
-        (scan.job.items || []).filter((item) => !item.managed).forEach((item) => {
+        (scan.job.items || []).filter((item) => !item.already_managed).forEach((item) => {
           if (!scan.selected.has(item.path)) next.add(item.path);
         });
         scan.selected = next;
@@ -1907,18 +1936,22 @@
     try {
       const result = await api('/api/repos', { method: 'POST', body: { paths } });
       const added = result.added || 0;
+      const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
       const failed = (result.results || []).filter((item) => !item.ok).length;
       const successKeys = new Set(
         (result.results || []).filter((item) => item.ok).map((item) => normalizePath(item.path))
       );
       (scan.job.items || []).forEach((item) => {
-        if (successKeys.has(normalizePath(item.path))) item.managed = true;
+        if (successKeys.has(normalizePath(item.path))) item.already_managed = true;
       });
       scan.selected.clear();
       await loadRepos();
       refreshAll(true);
       renderScan();
-      toast(`已添加 ${added} 个仓库${failed ? `，${failed} 条失败` : ''}。`, failed ? 'warn' : 'success');
+      const parts = [`新增 ${added} 个`];
+      if (skipped > 0) parts.push(`跳过 ${skipped} 个（已存在）`);
+      if (failed > 0) parts.push(`${failed} 条失败`);
+      toast(`${parts.join('，')}。`, failed ? 'warn' : 'success');
     } catch (err) {
       showModalError(`批量添加失败：${err.message}`);
       busyButton(button, false);
