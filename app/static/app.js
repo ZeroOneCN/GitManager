@@ -466,6 +466,15 @@
   }
 
   /**
+   * 判断是否需要展示协议徽标：HTTPS 为默认协议，不显示；仅 SSH / 本地等非默认情况显示。
+   * 参数：protocol 协议标识（https/ssh/local/unknown）。
+   * 返回值：布尔值，true 表示展示徽标。
+   */
+  function showProtocolBadge(protocol) {
+    return protocol === 'ssh' || protocol === 'local';
+  }
+
+  /**
    * 渲染仓库远端地址（完整展示，不省略，附带协议徽标与复制按钮）。
    * 参数：status 仓库状态对象（可能为 null）。
    * 返回值：HTML 字符串；无远端时为空串。
@@ -478,7 +487,7 @@
       const meta = protocolMeta(remote.protocol);
       return `<div class="remote-line">
         <span class="label">${escapeHtml(remote.name)}</span>
-        <span class="protocol-badge ${meta.cls}">${meta.label}</span>
+        ${showProtocolBadge(remote.protocol) ? `<span class="protocol-badge ${meta.cls}">${meta.label}</span>` : ''}
         <code class="full-text">${escapeHtml(url)}</code>
         <button class="btn-link" data-copy="${escapeHtml(url)}" data-copy-label="远端地址">复制</button>
       </div>`;
@@ -516,7 +525,7 @@
     const header = `<div class="card-head">
       <div class="repo-name" title="${escapeHtml(repo.name)}">${escapeHtml(repo.name)}</div>
       <div class="repo-pills">${pillBranch(status)}
-        ${status && protocol !== 'unknown' ? `<span class="pill pill-protocol ${protocolInfo.cls}">${protocolInfo.label}</span>` : ''}
+        ${status && showProtocolBadge(protocol) ? `<span class="pill pill-protocol ${protocolInfo.cls}">${protocolInfo.label}</span>` : ''}
         <span class="pill is-${health.key}"><span class="dot"></span>${escapeHtml(health.label)}</span>
       </div>
     </div>
@@ -976,7 +985,7 @@
           const meta = protocolMeta(remote.protocol);
           return `<div class="remote-line">
             <span class="label">${escapeHtml(remote.name)}</span>
-            <span class="protocol-badge ${meta.cls}">${meta.label}</span>
+            ${showProtocolBadge(remote.protocol) ? `<span class="protocol-badge ${meta.cls}">${meta.label}</span>` : ''}
             <code class="full-text">${escapeHtml(remote.push_url || remote.fetch_url)}</code>
             <button class="btn-link" data-copy="${escapeHtml(remote.push_url || remote.fetch_url)}" data-copy-label="远端地址">复制</button>
           </div>`;
@@ -2703,7 +2712,7 @@
       const meta = protocolMeta(remote.protocol);
       return `<div class="remote-line">
         <span class="label">${escapeHtml(remote.name)}</span>
-        <span class="protocol-badge ${meta.cls}">${meta.label}</span>
+        ${showProtocolBadge(remote.protocol) ? `<span class="protocol-badge ${meta.cls}">${meta.label}</span>` : ''}
         <code class="full-text">${escapeHtml(remote.push_url || remote.fetch_url)}</code>
         <button class="btn-link" data-copy="${escapeHtml(remote.push_url || remote.fetch_url)}" data-copy-label="远端地址">复制</button>
       </div>`;

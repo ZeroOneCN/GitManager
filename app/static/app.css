@@ -468,7 +468,26 @@ a { color: var(--accent); }
 .foot-meta { font-size: 11px; color: var(--muted); min-width: 0; }
 .foot-meta .label { color: var(--muted-2); }
 .foot-ssh { color: var(--muted); }
-.card-actions { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+/* 操作区统一单行：不换行，溢出时容器内部横向滚动，按钮尺寸不随状态变化 */
+.card-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: flex-end;
+  /* safe 关键字：内容溢出时回退为左对齐，保证横向滚动能访问到第一个按钮 */
+  justify-content: safe flex-end;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+.card-actions .btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  min-height: 32px;
+}
 
 .card-loading {
   padding: 28px 4px;
@@ -711,14 +730,20 @@ a { color: var(--accent); }
 .modal-foot {
   display: flex;
   justify-content: flex-end;
+  /* safe 关键字：内容溢出时回退为左对齐，避免第一个按钮被裁掉 */
+  justify-content: safe flex-end;
+  align-items: center;
   gap: 8px;
   padding: 12px 20px;
   border-top: 1px solid var(--border);
   background: var(--surface-2);
   flex: none;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
 }
-.modal-foot .btn { height: 34px; padding: 0 16px; }
+.modal-foot .btn { height: 34px; min-height: 32px; padding: 0 16px; flex: 0 0 auto; white-space: nowrap; }
 .modal-foot:empty { display: none; }
 
 /* 确认层位于业务弹窗之上，独立焦点与遮罩 */

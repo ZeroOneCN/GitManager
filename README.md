@@ -160,3 +160,4 @@
 | 2026-11-04 23:10 | M16 第四期前端 | ✅ | 顶部 8 项统计新增“待处理变更数 / 已静音数 / 已跟踪但被 ignore”；卡片“忽略规则（N）”面板四分组 + 三个动作；静音折叠 `details.muted-details` + 取消静音；`window.__nativeDialogCalls` 全程 0 |
 | 2026-11-04 23:25 | M17 第五期远端诊断 | ✅ | `domain.py` 新增 `classify_remote_error`（403/401/SSH/网络/分支策略）、`detect_remote_protocol`、`https_to_ssh`、`parse_cmdkey_output`；`services.py` 新增 `_remote_info`、远端 SSH 转换、`cmdkey` 凭据列表/清除、交互式 GCM 登录；前端诊断卡片、协议徽标、HTTPS 凭据面板 |
 | 2026-11-04 23:35 | M18 第四/五期验收 | ✅ | `scripts/selftest.py` **160/160 PASS**（原 125 项保留 + 新增 35 项）；`tests/ui_phase3_check.py` **34/34 PASS**（原 24 项 + 静音折叠/三类计数/忽略面板 10 项）；8765 以 v1.3.0 重启并核验 `/api/health`、`/api/repos/{id}/ignore` |
+| 2026-11-05 | M19 界面微调 | ✅ | 操作区（卡片底部、弹窗 footer）统一单行 + 内部横向滚动，状态切换按钮尺寸不变；HTTPS 默认协议徽标隐藏，SSH/本地保留，SSH 身份提示不变；`tests/ui_phase3_check.py` **44/44 PASS**（1280/1440/1920 + 最窄 360px 均验证） |
