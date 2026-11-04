@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,17 +13,23 @@ from typing import Any
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .config import Settings, load_settings
+from .config import (
+    Settings,
+    build_access_urls,
+    firewall_hint,
+    is_loopback_host,
+    load_settings,
+)
 from .db import Database
-from .git_runner import GitExecutor
+from .git_runner import CLIENT_IP, GitExecutor
 from .services import ApiError, GitManagerService
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 APP_DIR = Path(__file__).resolve().parent
 
 settings: Settings = load_settings()
@@ -39,13 +46,38 @@ service = GitManagerService(settings, database, executor)
 
 logger = logging.getLogger("gitmanager")
 
-# 允许的 Host 头（防 DNS rebinding；服务本身只绑定回环地址）
-_ALLOWED_HOSTS = {"127.0.0.1", "localhost", settings.host.lower()}
+# 鉴权 Cookie 名与有效期（HttpOnly + SameSite=Lax，避免脚本读取与跨站提交）
+AUTH_COOKIE_NAME = "gitmanager_token"
+AUTH_COOKIE_MAX_AGE = 7 * 24 * 3600
+
+# 匿名可访问的路径：登录页、登录接口与静态资源
+ANONYMOUS_PATHS = {
+    "/login",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/state",
+}
+
+
+def _is_authenticated(request: Request) -> bool:
+    """判断当前请求是否已通过访问令牌鉴权。
+
+    参数：
+        request: 当前请求。
+    返回值：
+        已配置令牌且 Cookie 与令牌一致时返回 True。
+    """
+    if not settings.access_token:
+        return False
+    cookie = request.cookies.get(AUTH_COOKIE_NAME, "")
+    if not cookie:
+        return False
+    return hmac.compare_digest(cookie, settings.access_token)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """应用生命周期：启动时初始化数据库并清理超期审计。
+    """应用生命周期：启动时初始化数据库、清理超期审计并打印访问入口。
 
     参数：
         _: FastAPI 实例（未使用）。
@@ -61,6 +93,15 @@ async def lifespan(_: FastAPI):
         "、".join(str(root) for root in roots),
         purged,
     )
+    urls = build_access_urls(settings.host, settings.port)
+    logger.info("可访问地址：%s", "  ".join(urls))
+    if settings.lan_enabled:
+        logger.warning(
+            "局域网模式已开启：令牌鉴权=%s，允许的 Host=%s",
+            "启用" if settings.auth_required else "未启用（缺少令牌）",
+            "、".join(settings.allowed_hosts),
+        )
+        logger.info("如无法从其他设备访问，请手工放行防火墙：%s", firewall_hint(settings.port))
     yield
 
 
@@ -73,26 +114,48 @@ app = FastAPI(
 
 
 @app.middleware("http")
-async def enforce_loopback_host(request: Request, call_next):
-    """校验 Host 头，拒绝非本机来源的请求。
+async def enforce_access_control(request: Request, call_next):
+    """统一访问控制：Host 白名单校验、局域网令牌鉴权、来源 IP 注入。
 
     参数：
         request: 当前请求。
         call_next: 后续处理链。
     返回值：
-        正常响应；Host 非法时返回 403 JSON。
+        正常响应；Host 非法返回 400，未鉴权的接口返回 401，页面请求重定向到登录页。
     """
     host_header = request.headers.get("host", "")
     host_only = host_header.split(":", 1)[0].strip().lower()
-    if host_only not in _ALLOWED_HOSTS:
+    if not host_only or host_only not in settings.allowed_hosts:
         return JSONResponse(
-            status_code=403,
+            status_code=400,
             content={
                 "code": "forbidden_host",
-                "message": "仅允许从本机（127.0.0.1 / localhost）访问。",
+                "message": (
+                    "Host 不在允许列表内（防 DNS rebinding）。"
+                    "局域网访问请在 .env 的 GITMANAGER_ALLOWED_HOSTS 加入本机 IP/主机名。"
+                ),
+                "allowed_hosts": list(settings.allowed_hosts),
             },
         )
-    return await call_next(request)
+
+    path = request.url.path
+    authenticated = _is_authenticated(request)
+    if settings.auth_required and not authenticated:
+        if path.startswith("/api/") and path not in ANONYMOUS_PATHS:
+            return JSONResponse(
+                status_code=401,
+                content={"code": "unauthorized", "message": "需要访问令牌，请先登录。"},
+            )
+        if path not in ANONYMOUS_PATHS and not path.startswith("/static/"):
+            return RedirectResponse("/login", status_code=303)
+
+    client_host = request.client.host if request.client else ""
+    # 只有非本机来源才记录客户端 IP，避免本机操作产生无效审计字段
+    context_token = CLIENT_IP.set("" if is_loopback_host(client_host) else client_host)
+    try:
+        return await call_next(request)
+    finally:
+        CLIENT_IP.reset(context_token)
 
 
 @app.exception_handler(ApiError)
@@ -172,6 +235,12 @@ class AddReposRequest(BaseModel):
     """批量添加仓库请求。"""
 
     paths: list[str] = Field(..., min_length=1, max_length=500, description="仓库绝对路径列表")
+
+
+class LoginRequest(BaseModel):
+    """访问令牌登录请求。"""
+
+    token: str = Field(..., min_length=1, max_length=200, description="GITMANAGER_ACCESS_TOKEN")
 
 
 class PullRequest(BaseModel):
@@ -291,6 +360,69 @@ class SshTestRequest(BaseModel):
 
 
 # ----------------------------------------------------------------------
+# 鉴权（仅局域网监听时强制生效）
+# ----------------------------------------------------------------------
+
+
+@app.get("/api/auth/state")
+def auth_state(request: Request) -> dict[str, Any]:
+    """返回当前鉴权状态（匿名可访问，供登录页判断）。
+
+    参数：
+        request: 当前请求。
+    返回值：
+        {auth_required, authenticated, lan_enabled}。
+    """
+    return {
+        "auth_required": settings.auth_required,
+        "authenticated": _is_authenticated(request),
+        "lan_enabled": settings.lan_enabled,
+    }
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: LoginRequest) -> JSONResponse:
+    """校验访问令牌并写入 HttpOnly Cookie。
+
+    参数：
+        payload: 令牌文本。
+    返回值：
+        成功时 200 并设置 Cookie；失败时 401。
+    """
+    if not settings.access_token or not hmac.compare_digest(
+        payload.token.strip(), settings.access_token
+    ):
+        return JSONResponse(
+            status_code=401,
+            content={"code": "invalid_token", "message": "访问令牌不正确，请检查 .env 配置。"},
+        )
+    response = JSONResponse(content={"ok": True, "message": "登录成功。"})
+    response.set_cookie(
+        AUTH_COOKIE_NAME,
+        settings.access_token,
+        max_age=AUTH_COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def auth_logout() -> JSONResponse:
+    """清除登录 Cookie（不修改 .env 中的令牌）。
+
+    参数：
+        无。
+    返回值：
+        成功 JSON，并删除 Cookie。
+    """
+    response = JSONResponse(content={"ok": True, "message": "已退出登录。"})
+    response.delete_cookie(AUTH_COOKIE_NAME, path="/")
+    return response
+
+
+# ----------------------------------------------------------------------
 # 元信息
 # ----------------------------------------------------------------------
 
@@ -314,17 +446,25 @@ def get_settings() -> dict[str, Any]:
     参数：
         无。
     返回值：
-        监听地址、git 路径、动态白名单根目录、扫描参数、日志保留天数与 pull stash 默认值。
+        监听地址与访问入口、鉴权状态、允许的 Host、git 路径、动态白名单根目录、
+        扫描参数、日志保留天数与 pull stash 默认值；不包含令牌本身。
     """
     roots = service.allowed_root_paths()
     default_identity = next(
         (item for item in service.list_ssh_identities()["items"] if item["is_default"]),
         None,
     )
+    access_urls = build_access_urls(settings.host, settings.port)
     return {
         "host": settings.host,
         "port": settings.port,
-        "service_url": f"http://{settings.host}:{settings.port}",
+        "service_url": access_urls[0],
+        "access_urls": access_urls,
+        "lan_enabled": settings.lan_enabled,
+        "auth_required": settings.auth_required,
+        "token_configured": bool(settings.access_token),
+        "allowed_hosts": list(settings.allowed_hosts),
+        "firewall_hint": firewall_hint(settings.port),
         "git_executable": settings.git_executable,
         "allowed_roots": [str(root) for root in roots],
         "log_retention_days": settings.log_retention_days,
@@ -931,6 +1071,22 @@ def audit_actions() -> dict[str, Any]:
 # ----------------------------------------------------------------------
 # 前端页面
 # ----------------------------------------------------------------------
+
+
+@app.get("/login")
+def login_page() -> FileResponse:
+    """返回局域网访问登录页（匿名可访问）。
+
+    参数：
+        无。
+    返回值：
+        login.html（禁用缓存）。
+    """
+    return FileResponse(
+        APP_DIR / "templates" / "login.html",
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/")

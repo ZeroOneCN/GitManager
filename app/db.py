@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     ok INTEGER NOT NULL,
     duration_ms INTEGER NOT NULL,
     forced INTEGER NOT NULL DEFAULT 0,
-    output_summary TEXT NOT NULL DEFAULT ''
+    output_summary TEXT NOT NULL DEFAULT '',
+    client_ip TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(ts);
@@ -138,6 +139,11 @@ class Database:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(audit_logs)")}
             if "identity_name" not in columns:
                 conn.execute("ALTER TABLE audit_logs ADD COLUMN identity_name TEXT")
+            # 兼容旧数据库：补充局域网来源 IP 列（仅非回环请求写入）
+            if "client_ip" not in columns:
+                conn.execute(
+                    "ALTER TABLE audit_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''"
+                )
         if default_roots and not self.list_allowed_roots():
             for root in default_roots:
                 try:
@@ -583,7 +589,7 @@ class Database:
 
         参数：
             record: 包含 ts/repo_id/repo_path/action/command/exit_code/ok/
-                    duration_ms/forced/output_summary/identity_name 的字典。
+                    duration_ms/forced/output_summary/identity_name/client_ip 的字典。
         返回值：
             新审计记录的 id。
         """
@@ -592,8 +598,8 @@ class Database:
                 """
                 INSERT INTO audit_logs
                     (ts, repo_id, repo_path, action, command, exit_code, ok,
-                     duration_ms, forced, output_summary, identity_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     duration_ms, forced, output_summary, identity_name, client_ip)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["ts"],
@@ -607,6 +613,7 @@ class Database:
                     1 if record.get("forced") else 0,
                     record.get("output_summary", ""),
                     record.get("identity_name"),
+                    record.get("client_ip", ""),
                 ),
             )
             return int(cursor.lastrowid)
@@ -654,7 +661,7 @@ class Database:
             rows = conn.execute(
                 f"""
                 SELECT id, ts, repo_id, repo_path, action, command, exit_code,
-                       ok, duration_ms, forced, output_summary, identity_name
+                       ok, duration_ms, forced, output_summary, identity_name, client_ip
                 FROM audit_logs {where}
                 ORDER BY id DESC LIMIT ? OFFSET ?
                 """,

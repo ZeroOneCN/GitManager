@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GitManager · 访问令牌登录</title>
+  <style>
+    :root {
+      --bg: #f5f5f7;
+      --surface: #ffffff;
+      --border: #e8e8ed;
+      --text: #1d1d1f;
+      --muted: #6e6e73;
+      --accent: #0071e3;
+      --accent-hover: #0066cc;
+      --red: #c8102e;
+      --red-weak: #fdecec;
+      --radius: 18px;
+      --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable",
+              "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    .login-card {
+      width: min(400px, calc(100vw - 48px));
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 32px 28px 26px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
+    }
+    .brand { font-size: 13px; color: var(--muted); letter-spacing: 0.02em; }
+    h1 { margin: 6px 0 10px; font-size: 24px; font-weight: 600; letter-spacing: -0.01em; }
+    p.hint { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    input {
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fff;
+      font-family: inherit;
+      font-size: 14px;
+      color: var(--text);
+    }
+    input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.12); }
+    .error {
+      display: none;
+      margin-top: 12px;
+      padding: 9px 12px;
+      border-radius: 10px;
+      background: var(--red-weak);
+      color: var(--red);
+      font-size: 13px;
+    }
+    .error.show { display: block; }
+    .actions {
+      display: flex;
+      flex-wrap: nowrap;
+      align-items: center;
+      gap: 8px;
+      margin-top: 20px;
+    }
+    button {
+      flex: 0 0 auto;
+      min-height: 36px;
+      padding: 0 18px;
+      border-radius: 10px;
+      border: 1px solid transparent;
+      font-family: inherit;
+      font-size: 14px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .primary { margin-left: auto; background: var(--accent); color: #fff; }
+    .primary:hover { background: var(--accent-hover); }
+    .primary[disabled] { opacity: 0.55; cursor: default; }
+    .link { background: transparent; color: var(--accent); border-color: transparent; padding: 0 4px; }
+    .foot { margin-top: 18px; font-size: 12px; color: var(--muted); }
+    code { font-family: "SF Mono", Consolas, monospace; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <main class="login-card">
+    <div class="brand">GitManager Web</div>
+    <h1>输入访问令牌</h1>
+    <p class="hint">局域网访问需要校验令牌。令牌位于服务端 <code>.env</code> 的
+      <code>GITMANAGER_ACCESS_TOKEN</code>，或启动控制台打印的地址中。</p>
+    <form id="login-form" autocomplete="off">
+      <label for="token">访问令牌</label>
+      <input id="token" name="token" type="password" spellcheck="false"
+             placeholder="粘贴令牌后登录" autofocus>
+      <div class="error" id="login-error" role="alert"></div>
+      <div class="actions">
+        <button type="button" class="link" id="show-help">如何获取令牌？</button>
+        <button type="submit" class="primary" id="login-submit">登录</button>
+      </div>
+    </form>
+    <div class="foot" id="login-help" hidden>
+      在服务端项目根目录打开 <code>.env</code>，复制 <code>GITMANAGER_ACCESS_TOKEN</code> 的值；
+      若该值为空，把监听地址改为局域网地址后重启，服务会自动生成并写回 .env。
+    </div>
+  </main>
+  <script>
+    // 登录页交互：只调用鉴权接口，不读取任何本地存储。
+    (function () {
+      'use strict';
+      var form = document.getElementById('login-form');
+      var input = document.getElementById('token');
+      var submit = document.getElementById('login-submit');
+      var errorBox = document.getElementById('login-error');
+      var help = document.getElementById('login-help');
+
+      document.getElementById('show-help').addEventListener('click', function () {
+        help.hidden = !help.hidden;
+      });
+
+      function showError(message) {
+        errorBox.textContent = message;
+        errorBox.classList.add('show');
+      }
+
+      form.addEventListener('submit', function (event) {
+        event.preventDefault();
+        var token = input.value.trim();
+        if (!token) {
+          showError('请输入访问令牌。');
+          return;
+        }
+        errorBox.classList.remove('show');
+        submit.disabled = true;
+        fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: token }),
+        }).then(function (res) {
+          return res.json().catch(function () { return {}; }).then(function (data) {
+            if (res.ok) {
+              window.location.replace('/');
+              return;
+            }
+            showError((data && data.message) || '登录失败，请检查令牌。');
+          });
+        }).catch(function () {
+          showError('无法连接服务，请确认地址与端口正确。');
+        }).then(function () {
+          submit.disabled = false;
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

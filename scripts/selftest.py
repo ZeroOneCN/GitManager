@@ -92,6 +92,81 @@ def http_call(method: str, base: str, path: str, payload=None, timeout: int = 30
     return status, parsed
 
 
+def http_probe(
+    method: str,
+    base: str,
+    path: str,
+    payload=None,
+    headers: dict[str, str] | None = None,
+    timeout: int = 15,
+):
+    """调用接口并返回状态码、响应头与解析后的 JSON（用于鉴权测试）。
+
+    参数：
+        method: HTTP 方法。
+        base: 服务根地址。
+        path: 接口路径。
+        payload: 可选 JSON 请求体。
+        headers: 可选附加请求头（如 Cookie）。
+        timeout: 超时秒数。
+    返回值：
+        {status, headers, json, body}，不会抛出 HTTP 错误。
+    """
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        base + path,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json; charset=utf-8", **(headers or {})},
+    )
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        """禁止自动跟随重定向，便于断言登录页跳转。"""
+
+        def redirect_request(self, req, fp, code, msg, hdrs, newurl):  # noqa: D102
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            status = response.status
+            body = response.read().decode("utf-8", errors="replace")
+            resp_headers = dict(response.headers.items())
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        body = exc.read().decode("utf-8", errors="replace")
+        resp_headers = dict(exc.headers.items()) if exc.headers else {}
+    resp_headers = {str(key).lower(): value for key, value in resp_headers.items()}
+    parsed = None
+    if body:
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = {"raw": body[:500]}
+    return {"status": status, "headers": resp_headers, "json": parsed, "body": body}
+
+
+def raw_http_request(port: int, path: str, host_header: str, timeout: float = 5.0) -> str:
+    """用原始 socket 发起一个最小 HTTP 请求以自定义 Host 头。
+
+    参数：
+        port: 本机服务端口。
+        path: 请求路径。
+        host_header: 希望发送的 Host 头值。
+        timeout: 读超时秒数。
+    返回值：
+        响应首行文本（如 “HTTP/1.1 400 Bad Request”）。
+    """
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        payload = (
+            f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\n"
+            "Connection: close\r\n\r\n"
+        )
+        sock.sendall(payload.encode("utf-8"))
+        chunk = sock.recv(1024).decode("utf-8", errors="replace")
+    return chunk.splitlines()[0] if chunk else ""
+
+
 def run_git(git_exe: str, args: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
     """执行本地 git 命令（仅用于自测准备与校验）。
 
@@ -240,6 +315,27 @@ def wait_for_server(base: str, timeout: float = 30.0) -> bool:
     return False
 
 
+def wait_for_auth_server(base: str, timeout: float = 30.0) -> bool:
+    """等待启用了令牌鉴权的服务就绪（401 也视为已就绪）。
+
+    参数：
+        base: 服务根地址。
+        timeout: 最长等待秒数。
+    返回值：
+        服务可响应（200 或 401）时返回 True。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            probe = http_probe("GET", base, "/api/health", timeout=2)
+            if probe["status"] in (200, 401):
+                return True
+        except (urllib.error.URLError, ConnectionResetError, TimeoutError):
+            pass
+        time.sleep(0.35)
+    return False
+
+
 def main() -> int:
     """执行完整自测流程。
 
@@ -273,9 +369,15 @@ def main() -> int:
     ssh_dir = test_root / "ssh"
     extra_root: Path | None = None
     selftest_db = PROJECT_ROOT / "data" / "selftest.db"
+    lan_db = PROJECT_ROOT / "data" / "selftest_lan.db"
     server_log = PROJECT_ROOT / "data" / "selftest_server.log"
+    lan_log = PROJECT_ROOT / "data" / "selftest_lan.log"
+    lan_port = port + 2
+    lan_token = "selftest-lan-token-9f2c"
     server: subprocess.Popen | None = None
+    lan_server: subprocess.Popen | None = None
     log_handle = None
+    lan_log_handle = None
 
     def cleanup() -> None:
         """停止服务并清理临时文件。
@@ -285,20 +387,23 @@ def main() -> int:
         返回值：
             无。
         """
-        nonlocal server, log_handle
-        if server is not None and server.poll() is None:
-            server.terminate()
-            try:
-                server.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait(timeout=5)
-        if log_handle is not None:
-            try:
-                log_handle.close()
-            except OSError:
-                pass
-            log_handle = None
+        nonlocal server, log_handle, lan_server, lan_log_handle
+        for proc in (server, lan_server):
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+        for handle in (log_handle, lan_log_handle):
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+        log_handle = None
+        lan_log_handle = None
         if extra_root is not None and extra_root.exists():
             force_rmtree(extra_root)
         if keep:
@@ -327,17 +432,19 @@ def main() -> int:
         if test_root.exists():
             print(f"警告：临时目录未能完全删除，请手动清理：{test_root}")
         for suffix in ("", "-wal", "-shm"):
-            target = Path(str(selftest_db) + suffix)
-            if target.exists():
+            for db_path in (selftest_db, lan_db):
+                target = Path(str(db_path) + suffix)
+                if target.exists():
+                    try:
+                        target.unlink()
+                    except OSError:
+                        pass
+        for log_path in (server_log, lan_log):
+            if log_path.exists():
                 try:
-                    target.unlink()
+                    log_path.unlink()
                 except OSError:
                     pass
-        if server_log.exists():
-            try:
-                server_log.unlink()
-            except OSError:
-                pass
 
     def make_repo(path: Path) -> None:
         """创建一个带初始提交的真实 Git 仓库（扫描与绑定测试使用）。
@@ -457,6 +564,120 @@ def main() -> int:
 
         status, _ = http_call("GET", base, "/api/nonexistent")
         check("未知接口返回结构化错误", status == 404)
+        check(
+            "默认回环监听免令牌访问",
+            bool((settings_data or {}).get("auth_required")) is False
+            and bool((settings_data or {}).get("lan_enabled")) is False,
+            f"auth_required={(settings_data or {}).get('auth_required')} "
+            f"lan_enabled={(settings_data or {}).get('lan_enabled')}",
+        )
+
+        # ---------- 2.1 局域网模式：令牌鉴权与 Host 白名单 ----------
+        lan_base = f"http://127.0.0.1:{lan_port}"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            lan_port_in_use = probe.connect_ex(("127.0.0.1", lan_port)) == 0
+        if lan_port_in_use:
+            check("局域网测试端口可用", False, f"127.0.0.1:{lan_port} 已被占用")
+            return 1
+        check("局域网测试端口可用", True, f"127.0.0.1:{lan_port}")
+
+        lan_env = os.environ.copy()
+        lan_env["GITMANAGER_HOST"] = "0.0.0.0"
+        lan_env["GITMANAGER_PORT"] = str(lan_port)
+        lan_env["GITMANAGER_ACCESS_TOKEN"] = lan_token
+        lan_env["GITMANAGER_ALLOWED_HOSTS"] = "127.0.0.1;localhost"
+        lan_env["GITMANAGER_DB"] = str(lan_db)
+        lan_env["SSH_DIR"] = str(ssh_dir)
+        lan_log_handle = open(lan_log, "w", encoding="utf-8")
+        lan_server = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "app.main:app",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(lan_port),
+                "--log-level",
+                "info",
+            ],
+            cwd=str(PROJECT_ROOT),
+            env=lan_env,
+            stdout=lan_log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        if not wait_for_auth_server(lan_base):
+            tail = ""
+            if lan_log.exists():
+                tail = "\n".join(lan_log.read_text(encoding="utf-8", errors="replace").splitlines()[-20:])
+            check("局域网模式服务启动", False, tail or "鉴权服务健康检查超时")
+            return 1
+        check("局域网模式服务启动（监听 0.0.0.0）", True, lan_base)
+
+        unauth = http_probe("GET", lan_base, "/api/health")
+        check(
+            "未登录访问业务接口返回 401",
+            unauth["status"] == 401 and (unauth["json"] or {}).get("code") == "unauthorized",
+            f"HTTP {unauth['status']}",
+        )
+        redirect = http_probe("GET", lan_base, "/")
+        location = (redirect["headers"] or {}).get("location", "")
+        check(
+            "未登录访问首页跳转到登录页",
+            redirect["status"] in (302, 303, 307) and location.endswith("/login"),
+            f"HTTP {redirect['status']} location={location}",
+        )
+        login_page = http_probe("GET", lan_base, "/login")
+        check(
+            "登录页可匿名访问且提示令牌来源",
+            login_page["status"] == 200 and "GITMANAGER_ACCESS_TOKEN" in login_page["body"],
+            f"HTTP {login_page['status']}",
+        )
+        bad_login = http_probe("POST", lan_base, "/api/auth/login", {"token": "wrong-token"})
+        check(
+            "错误令牌登录返回 401",
+            bad_login["status"] == 401,
+            f"HTTP {bad_login['status']} {(bad_login['json'] or {}).get('message')}",
+        )
+        good_login = http_probe("POST", lan_base, "/api/auth/login", {"token": lan_token})
+        set_cookie = (good_login["headers"] or {}).get("set-cookie", "")
+        lower_cookie = set_cookie.lower()
+        check(
+            "正确令牌登录成功并写入 HttpOnly SameSite=Lax Cookie",
+            good_login["status"] == 200
+            and "httponly" in lower_cookie
+            and "samesite=lax" in lower_cookie,
+            set_cookie.replace("\n", " "),
+        )
+        cookie_pair = set_cookie.split(";", 1)[0].strip()
+        authed = http_probe("GET", lan_base, "/api/repos", headers={"Cookie": cookie_pair})
+        check(
+            "携带鉴权 Cookie 后可访问业务接口",
+            authed["status"] == 200 and "items" in (authed["json"] or {}),
+            f"HTTP {authed['status']}",
+        )
+        lan_settings = http_probe(
+            "GET", lan_base, "/api/settings", headers={"Cookie": cookie_pair}
+        )
+        lan_settings_data = lan_settings["json"] or {}
+        check(
+            "局域网模式服务设置标明鉴权已启用且不泄露令牌",
+            lan_settings["status"] == 200
+            and lan_settings_data.get("auth_required") is True
+            and lan_settings_data.get("token_configured") is True
+            and lan_token not in lan_settings["body"],
+            str({key: lan_settings_data.get(key) for key in (
+                "host", "lan_enabled", "auth_required", "token_configured", "allowed_hosts"
+            )}),
+        )
+        evil_line = raw_http_request(lan_port, "/api/health", "evil.example.com")
+        check(
+            "Host 不在白名单时返回 400",
+            "400" in evil_line,
+            evil_line,
+        )
 
         request = urllib.request.Request(base + "/")
         try:

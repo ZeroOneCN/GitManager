@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 import os
+import re
+import secrets
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,8 +18,14 @@ from dotenv import load_dotenv
 # 项目根目录（app/config.py 的上一级）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# 允许的服务监听地址：仅本机回环
-ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+# 回环监听地址集合：命中时视为仅本机访问，可免令牌
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+# 允许的 Host 头默认值（防 DNS rebinding）
+DEFAULT_ALLOWED_HOSTS = "127.0.0.1;localhost"
+
+# .env 中令牌行的匹配模式（用于自动生成后写回）
+_TOKEN_LINE = re.compile(r"^GITMANAGER_ACCESS_TOKEN=.*$", re.MULTILINE)
 
 
 class ConfigError(RuntimeError):
@@ -90,6 +99,118 @@ def _env_list(name: str, default: str) -> tuple[str, ...]:
     return tuple(items)
 
 
+def is_loopback_host(host: str) -> bool:
+    """判断监听地址是否属于本机回环。
+
+    参数：
+        host: 监听地址文本。
+    返回值：
+        127.0.0.1 / localhost / ::1 时返回 True。
+    """
+    return host.strip().lower() in LOOPBACK_HOSTS
+
+
+def detect_lan_ipv4() -> list[str]:
+    """探测本机可用的局域网 IPv4 地址（不发起真实网络请求）。
+
+    参数：
+        无。
+    返回值：
+        去重后的非回环 IPv4 列表；探测失败时返回空列表。
+    """
+    addresses: list[str] = []
+
+    def add(value: str) -> None:
+        """把候选地址加入结果列表（过滤空值与回环）。
+
+        参数：
+            value: IPv4 字符串。
+        返回值：
+            无。
+        """
+        text = value.strip()
+        if text and text not in addresses and not text.startswith("127."):
+            addresses.append(text)
+
+    # 方式一：UDP connect 仅由路由表选出出口网卡地址，不会真的发包
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            add(probe.getsockname()[0])
+    except OSError:
+        pass
+    # 方式二：解析主机名（覆盖多网卡场景）
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            add(info[4][0])
+    except OSError:
+        pass
+    return addresses
+
+
+def build_access_urls(host: str, port: int) -> list[str]:
+    """生成服务访问地址列表（本机 + 探测到的局域网 IPv4）。
+
+    参数：
+        host: 监听地址。
+        port: 服务端口。
+    返回值：
+        可直接点击的 http 地址列表；监听回环时只含本机地址。
+    """
+    urls: list[str] = [f"http://127.0.0.1:{port}", f"http://localhost:{port}"]
+    if not is_loopback_host(host):
+        for ip in detect_lan_ipv4():
+            urls.append(f"http://{ip}:{port}")
+    return urls
+
+
+def firewall_hint(port: int) -> str:
+    """生成 Windows 防火墙放行命令提示（不自动执行）。
+
+    参数：
+        port: 服务端口。
+    返回值：
+        供用户手工执行的 netsh 命令文本。
+    """
+    return (
+        f'netsh advfirewall firewall add rule name="GitManager Web {port}" '
+        f'dir=in action=allow protocol=TCP localport={port} profile=private'
+    )
+
+
+def _ensure_access_token(env_path: Path, lan_enabled: bool) -> str:
+    """确保局域网模式存在访问令牌（缺失时生成并写回 .env）。
+
+    参数：
+        env_path: .env 文件路径。
+        lan_enabled: 是否为非回环监听（只有此时才强制令牌）。
+    返回值：
+        当前生效的令牌文本；回环模式且未配置时返回空字符串。
+    """
+    token = (os.getenv("GITMANAGER_ACCESS_TOKEN") or "").strip()
+    if token or not lan_enabled:
+        return token
+
+    token = secrets.token_urlsafe(32)
+    try:
+        original = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        if _TOKEN_LINE.search(original):
+            updated = _TOKEN_LINE.sub(f"GITMANAGER_ACCESS_TOKEN={token}", original)
+        else:
+            separator = "" if not original or original.endswith("\n") else "\n"
+            updated = f"{original}{separator}GITMANAGER_ACCESS_TOKEN={token}\n"
+        env_path.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        print(f"[警告] 访问令牌写回 .env 失败：{exc}")
+    os.environ["GITMANAGER_ACCESS_TOKEN"] = token
+    print("=" * 62)
+    print("已为局域网访问自动生成访问令牌（已写入 .env）：")
+    print(f"  GITMANAGER_ACCESS_TOKEN={token}")
+    print("请妥善保管；如需更换，删除该行后重启即可重新生成。")
+    print("=" * 62)
+    return token
+
+
 def path_is_under(path: Path, roots: tuple[Path, ...] | list[Path]) -> bool:
     """判断路径是否位于任一允许根目录之下（Windows 大小写不敏感）。
 
@@ -113,6 +234,8 @@ class Settings:
 
     host: str
     port: int
+    access_token: str
+    allowed_hosts: tuple[str, ...]
     git_executable: str
     db_path: Path
     allowed_roots: tuple[Path, ...]
@@ -127,6 +250,28 @@ class Settings:
     ssh_executable: str = "ssh"
     ssh_keygen_executable: str = "ssh-keygen"
     ssh_test_timeout_seconds: int = 10
+
+    @property
+    def lan_enabled(self) -> bool:
+        """是否为非回环监听（即允许局域网访问）。
+
+        参数：
+            无。
+        返回值：
+            监听地址不是回环地址时返回 True。
+        """
+        return not is_loopback_host(self.host)
+
+    @property
+    def auth_required(self) -> bool:
+        """是否需要令牌鉴权（局域网监听时强制开启）。
+
+        参数：
+            无。
+        返回值：
+            非回环监听且已配置令牌时返回 True。
+        """
+        return self.lan_enabled and bool(self.access_token)
 
     def is_path_allowed(self, path: Path) -> bool:
         """判断给定绝对路径是否位于 .env 初始白名单根目录内。
@@ -147,17 +292,26 @@ def load_settings() -> Settings:
     返回值：
         校验通过的 Settings 实例。
     异常：
-        ConfigError: 监听地址非回环、git 可执行文件缺失、白名单为空等不安全配置。
+        ConfigError: git 可执行文件缺失、白名单为空等不安全配置。
     """
     load_dotenv(PROJECT_ROOT / ".env", override=False)
 
-    host = (os.getenv("APP_HOST") or "127.0.0.1").strip()
-    if host not in ALLOWED_HOSTS:
-        raise ConfigError(
-            f"APP_HOST={host} 不被允许：服务只允许监听 127.0.0.1 或 localhost"
-        )
+    host = (os.getenv("GITMANAGER_HOST") or "127.0.0.1").strip()
+    if not host:
+        host = "127.0.0.1"
 
-    port = _env_int("APP_PORT", 8765, minimum=1)
+    port = _env_int("GITMANAGER_PORT", 8765, minimum=1)
+    lan_enabled = not is_loopback_host(host)
+    access_token = _ensure_access_token(PROJECT_ROOT / ".env", lan_enabled)
+
+    allowed_hosts = _env_list("GITMANAGER_ALLOWED_HOSTS", DEFAULT_ALLOWED_HOSTS)
+    allowed_hosts = tuple(item.lower() for item in allowed_hosts)
+    if lan_enabled and all(is_loopback_host(item) for item in allowed_hosts):
+        # 局域网监听但白名单只有回环地址：从其它设备访问会被 400 拒绝，需明确提醒
+        print(
+            "[安全提示] 当前监听非回环地址，但 GITMANAGER_ALLOWED_HOSTS 仅包含回环地址；"
+            "请把本机局域网 IP 或主机名显式加入该列表，否则局域网请求会被 400 拒绝。"
+        )
 
     git_executable = (os.getenv("GIT_EXECUTABLE") or "git").strip()
     if not Path(git_executable).is_file():
@@ -198,6 +352,8 @@ def load_settings() -> Settings:
     return Settings(
         host=host,
         port=port,
+        access_token=access_token,
+        allowed_hosts=allowed_hosts,
         git_executable=str(git_resolved),
         db_path=db_path.resolve(),
         allowed_roots=tuple(roots),

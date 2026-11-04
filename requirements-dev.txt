@@ -1,0 +1,6 @@
+# 开发/测试依赖（UI 校验使用 Playwright，运行前需安装浏览器内核）
+-r requirements.txt
+
+playwright==1.64.0
+greenlet==3.2.4
+pyee==14.0.0

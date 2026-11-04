@@ -9,11 +9,15 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .db import Database, now_iso
+
+# 当前请求的客户端 IP（仅非回环来源时由接入层写入，用于局域网审计）
+CLIENT_IP: ContextVar[str] = ContextVar("gitmanager_client_ip", default="")
 
 
 @dataclass
@@ -186,6 +190,7 @@ class GitExecutor:
                     "forced": forced,
                     "output_summary": summary,
                     "identity_name": identity_name,
+                    "client_ip": CLIENT_IP.get(),
                 }
             )
         except Exception:

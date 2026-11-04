@@ -1,3 +1,19 @@
-fastapi>=0.115
-uvicorn>=0.30
-python-dotenv>=1.0
+# GitManager 运行时依赖（Windows / Python 3.13 实测版本，全部精确锁定）
+# 生成方式：本机 pip freeze + 依赖闭包解析（Python 3.13.9）
+
+fastapi==0.141.1
+uvicorn==0.52.3
+python-dotenv==1.0.0
+
+# 关键间接依赖（锁定以避免上游漂移导致行为变化）
+starlette==1.6.0
+pydantic==2.12.3
+pydantic-core==2.41.4
+annotated-doc==0.0.5
+annotated-types==0.7.0
+typing-extensions==4.16.0
+typing-inspection==0.4.2
+anyio==4.15.1
+idna==3.20
+h11==0.16.0
+click==8.5.0

@@ -65,6 +65,7 @@
     btnSsh: document.getElementById('btn-ssh'),
     btnScan: document.getElementById('btn-scan'),
     btnCredentials: document.getElementById('btn-credentials'),
+    btnService: document.getElementById('btn-service'),
     identityStrip: document.getElementById('identity-strip'),
     toastStack: document.getElementById('toast-stack'),
     backdrop: document.getElementById('modal-backdrop'),
@@ -2928,6 +2929,66 @@
   }
 
   /**
+   * 打开“服务设置”面板：只读展示监听地址、鉴权状态、允许的 Host 与访问链接。
+   * 参数：无。
+   * 返回值：Promise<void>。
+   */
+  async function openServiceModal() {
+    let data;
+    try {
+      data = await api('/api/settings');
+    } catch (err) {
+      toast(`读取服务设置失败：${err.message}`, 'error', 6000);
+      return;
+    }
+    state.settings = data;
+    renderIdentityStrip();
+    const urls = data.access_urls || [];
+    const urlRows = urls.map((url) => `<div class="ignore-row">
+      <div class="ignore-main">
+        <div class="ignore-path full-text">${escapeHtml(url)}</div>
+        <div class="ignore-meta">
+          <button class="btn-link" data-copy="${escapeHtml(url)}" data-copy-label="访问链接">复制链接</button>
+        </div>
+      </div>
+    </div>`).join('');
+    const hosts = (data.allowed_hosts || []).join('、') || '未配置';
+    const authText = data.auth_required
+      ? '已启用（局域网访问需令牌）'
+      : '未启用（仅本机回环，免令牌）';
+    openModal({
+      title: '服务设置',
+      wide: true,
+      body: `
+        <div class="hint">本面板只读；如需修改监听地址、令牌或允许的 Host，请编辑服务端 <code>.env</code> 后重启服务。</div>
+        <div class="ignore-section">
+          <div class="ignore-row"><div class="ignore-main">
+            <div class="ignore-path">监听地址</div>
+            <div class="ignore-meta"><code>${escapeHtml(data.host)}:${escapeHtml(String(data.port))}</code></div>
+          </div></div>
+          <div class="ignore-row"><div class="ignore-main">
+            <div class="ignore-path">令牌鉴权</div>
+            <div class="ignore-meta">${escapeHtml(authText)}；令牌${data.token_configured ? '已配置' : '未配置'}（页面不显示完整令牌）</div>
+          </div></div>
+          <div class="ignore-row"><div class="ignore-main">
+            <div class="ignore-path">允许的 Host</div>
+            <div class="ignore-meta full-text">${escapeHtml(hosts)}</div>
+          </div></div>
+        </div>
+        <div class="ignore-section-title">可访问链接</div>
+        <div class="ignore-section">${urlRows || '<div class="commit-empty">暂无可用地址。</div>'}</div>
+        ${data.lan_enabled ? `<div class="hint">局域网访问前请手工放行防火墙（服务不会自动修改）：
+          <code class="full-text">${escapeHtml(data.firewall_hint || '')}</code>
+          <button class="btn-link" data-copy="${escapeHtml(data.firewall_hint || '')}" data-copy-label="防火墙命令">复制命令</button></div>` : ''}
+        <div class="hint">安全提醒：开启局域网访问后，同一网段的任意设备只要拿到令牌即可操作这些仓库，请仅在可信网络中使用。</div>
+        <div class="error-box" id="modal-error" hidden></div>
+      `,
+      foot: `<button class="btn btn-ghost" id="service-close">关闭</button>`,
+    });
+    document.getElementById('service-close').addEventListener('click', closeModal);
+  }
+
+  /**
    * 执行诊断卡片上的动作入口。
    * 参数：key 动作标识；repoId 仓库主键。
    * 返回值：无。
@@ -2975,6 +3036,7 @@
     el.btnSsh.addEventListener('click', openSshModal);
     el.btnScan.addEventListener('click', openScanModal);
     if (el.btnCredentials) el.btnCredentials.addEventListener('click', openCredentialsModal);
+    if (el.btnService) el.btnService.addEventListener('click', openServiceModal);
 
     el.grid.addEventListener('click', (event) => {
       const unmuteBtn = event.target.closest('[data-unmute]');
