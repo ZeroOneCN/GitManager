@@ -58,7 +58,7 @@ python run.py
 
 启动后访问 <http://127.0.0.1:8765>。默认仅本机可访问，且**不需要登录**。
 
-> 若使用 UI 自动化校验，另需 `pip install -r requirements-dev.txt` 并执行 `python -m playwright install chromium`。
+> 可选开发依赖见 `requirements-dev.txt`；仓库本身不包含 UI 自动化脚本。
 
 ---
 
@@ -179,13 +179,13 @@ GitManager/
 │  ├─ static/            # 原生 CSS/JS（无构建链）
 │  └─ templates/         # index.html / login.html
 ├─ scripts/selftest.py   # 端到端自测（独立端口与临时仓库）
-├─ tests/ui_phase3_check.py # Playwright UI 校验
-├─ docs/GitManagerWeb/   # 设计与验收文档
 ├─ data/                 # 运行时 SQLite 与日志（不入库）
 ├─ .env.example
 ├─ requirements.txt / requirements-dev.txt
 └─ run.py
 ```
+
+> 发布范围：仓库只包含运行所需源码与自测脚本。设计与验收文档、Playwright UI 校验脚本均只保留在作者本地，不随仓库发布。
 
 ---
 
@@ -194,12 +194,9 @@ GitManager/
 ```powershell
 # 端到端自测：会在 E:\Code\_gitmanager_selftest 下创建临时仓库，结束后自动清理
 python scripts\selftest.py
-
-# UI 校验：需先启动 8765，并安装 Playwright 与 Chromium
-python tests\ui_phase3_check.py
 ```
 
-当前基线：`selftest` 171/171 通过；UI 校验 52/52 通过（含 1280 / 1440 / 1920 三档视口、按钮单行、登录流、服务设置面板、无原生弹窗）。
+当前基线：`selftest` 171/171 通过（含工具栏、忽略归因/静音/取消跟踪、远端诊断、局域网令牌鉴权与 Host 白名单等用例）。
 
 ---
 
@@ -226,3 +223,4 @@ python tests\ui_phase3_check.py
 - **第三期**：忽略规则面板、审计查询与筛选、单行操作区与最窄卡片适配。
 - **第四/五期**：忽略成因归因（可忽略 / 已跟踪命中规则 / 规则来源）、本地静音、`git rm --cached` 取消跟踪；远端错误结构化诊断、HTTPS/SSH 协议徽标与地址转换、Windows HTTPS 凭据查看与清除。
 - **发布准备（本版）**：局域网监听 + 令牌鉴权 + Host 白名单 + 登录页 + 服务设置面板；依赖精确锁定与开发依赖拆分；仓库清理与 `.gitignore` 完善；README 改为对外发布版；补齐自测与 UI 校验。
+- **仓库收敛**：移除 `tests/`（UI 校验脚本改为作者本地使用，仓库内仅保留 `scripts/selftest.py`）；`docs/` 解除跟踪并加入忽略，设计与验收文档只保留本地。

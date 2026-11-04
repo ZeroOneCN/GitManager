@@ -6,6 +6,12 @@ data/
 *.db-wal
 *.db-shm
 
+# 设计/验收文档仅保留在本地，不对外发布
+docs/
+
+# 本地 UI 校验脚本与临时产物（不对外发布）
+tests/
+
 # Python 缓存与虚拟环境
 __pycache__/
 *.py[cod]
