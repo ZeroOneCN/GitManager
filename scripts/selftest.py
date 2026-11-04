@@ -31,6 +31,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import load_settings  # noqa: E402
+from app.domain import (  # noqa: E402
+    classify_remote_error,
+    detect_remote_protocol,
+    https_to_ssh,
+    parse_cmdkey_output,
+)
 from app.git_runner import build_ssh_command  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -964,6 +970,400 @@ def main() -> int:
             status == 200 and isinstance(remotes, list)
             and all("fetch_url" in item for item in remotes),
             str(remotes),
+        )
+
+        # ---------- 12.7 忽略归因、.gitignore 追加、静音与取消跟踪 ----------
+        ignore_dir = test_root / "ignore-repo"
+        make_repo(ignore_dir)
+        write_file(ignore_dir / "tracked.tmp", "tracked\n")
+        # 先显式跟踪，再写入 *.tmp 规则：否则 git add . 会因忽略规则跳过该文件
+        run_git(git_exe, ["add", "tracked.tmp"], cwd=ignore_dir)
+        write_file(ignore_dir / ".gitignore", "*.tmp\n")
+        run_git(git_exe, ["add", "."], cwd=ignore_dir)
+        run_git(git_exe, ["commit", "-m", "chore: tracked tmp"], cwd=ignore_dir)
+        # 修改已跟踪文件，使其出现在看板并命中 *.tmp 规则（tracked_ignored）
+        write_file(ignore_dir / "tracked.tmp", "tracked changed\n")
+        write_file(ignore_dir / "notes.txt", "notes\n")
+        write_file(ignore_dir / "dist" / "bundle.js", "console.log(1)\n")
+        status, added_ignore = http_call(
+            "POST", base, "/api/repos", {"paths": [str(ignore_dir)]}
+        )
+        ignore_id = ((added_ignore or {}).get("results") or [{}])[0].get("repo_id")
+        check(
+            "注册忽略归因测试仓库",
+            status == 200 and isinstance(ignore_id, int),
+            str(ignore_id),
+        )
+        status, report = http_call("GET", base, f"/api/repos/{ignore_id}/ignore")
+        report = report or {}
+        report_files = {item["path"]: item for item in report.get("files") or []}
+        tracked_tmp = report_files.get("tracked.tmp") or {}
+        notes = report_files.get("notes.txt") or {}
+        counts = report.get("counts") or {}
+        check(
+            "已跟踪且命中忽略规则的文件给出正确归因与规则来源",
+            status == 200 and tracked_tmp.get("tracked") is True
+            and tracked_tmp.get("ignored") is True
+            and tracked_tmp.get("diagnosis") == "tracked_ignored"
+            and ".gitignore:1:" in (tracked_tmp.get("ignore_source") or ""),
+            f"{tracked_tmp.get('diagnosis')} source={tracked_tmp.get('ignore_source')}",
+        )
+        check(
+            "未被规则匹配的未跟踪文件归因为可忽略",
+            notes.get("diagnosis") == "untracked_ignorable"
+            and notes.get("tracked") is False and notes.get("ignored") is False,
+            f"{notes.get('diagnosis')}",
+        )
+        check(
+            "忽略报告的三类计数分别统计",
+            counts.get("tracked_ignored", 0) >= 1 and counts.get("ignorable", 0) >= 1
+            and counts.get("pending") == counts.get("total"),
+            f"counts={counts}",
+        )
+
+        status, preview = http_call(
+            "POST", base, f"/api/repos/{ignore_id}/ignore/preview",
+            {"paths": ["notes.txt", "dist"]},
+        )
+        preview = preview or {}
+        rules = [item.get("rule") for item in preview.get("rules") or []]
+        check(
+            "规则建议：文件带前导斜杠、目录以斜杠结尾",
+            status == 200 and "/notes.txt" in rules and "dist/" in rules,
+            str(rules),
+        )
+        check(
+            "预览给出目标 .gitignore 与追加内容",
+            preview.get("target", "").endswith(".gitignore")
+            and preview.get("exists") is True
+            and "/notes.txt" in (preview.get("append") or ""),
+            f"target={preview.get('target')}",
+        )
+        original_gitignore = (ignore_dir / ".gitignore").read_text(encoding="utf-8")
+        status, appended = http_call(
+            "POST", base, f"/api/repos/{ignore_id}/ignore",
+            {"paths": ["notes.txt", "dist"]},
+        )
+        appended = appended or {}
+        content_after = (ignore_dir / ".gitignore").read_text(encoding="utf-8")
+        check(
+            "追加 .gitignore 保留原内容并写入新规则",
+            status == 200 and content_after.startswith(original_gitignore)
+            and "/notes.txt" in content_after and "dist/" in content_after,
+            f"appended={appended.get('appended')}",
+        )
+        status, status_after = http_call("GET", base, f"/api/repos/{ignore_id}/status")
+        untracked_paths = [
+            item.get("path") for item in ((status_after or {}).get("files") or {}).get("untracked") or []
+        ]
+        check(
+            "追加后未跟踪项立刻从看板列表消失",
+            status == 200 and "notes.txt" not in untracked_paths
+            and not any(path.startswith("dist/") for path in untracked_paths),
+            str(untracked_paths),
+        )
+        content_before_duplicate = (ignore_dir / ".gitignore").read_text(encoding="utf-8")
+        status, duplicate = http_call(
+            "POST", base, f"/api/repos/{ignore_id}/ignore",
+            {"paths": ["notes.txt", "dist"]},
+        )
+        duplicate = duplicate or {}
+        content_after_duplicate = (ignore_dir / ".gitignore").read_text(encoding="utf-8")
+        check(
+            "等价规则不重复追加且文件内容不变",
+            status == 200 and duplicate.get("appended") == []
+            and len(duplicate.get("skipped") or []) == 2
+            and content_after_duplicate == content_before_duplicate,
+            f"appended={duplicate.get('appended')} skipped={len(duplicate.get('skipped') or [])}",
+        )
+
+        newline_dir = test_root / "newline-repo"
+        make_repo(newline_dir)
+        write_file(newline_dir / ".gitignore", "*.log")
+        write_file(newline_dir / "latest.txt", "latest\n")
+        status, added_newline = http_call(
+            "POST", base, "/api/repos", {"paths": [str(newline_dir)]}
+        )
+        newline_id = ((added_newline or {}).get("results") or [{}])[0].get("repo_id")
+        status, newline_result = http_call(
+            "POST", base, f"/api/repos/{newline_id}/ignore",
+            {"paths": ["latest.txt"]},
+        )
+        newline_content = (newline_dir / ".gitignore").read_text(encoding="utf-8")
+        check(
+            "原 .gitignore 无末尾换行时自动补一个再追加",
+            status == 200 and newline_content == "*.log\n/latest.txt\n",
+            repr(newline_content),
+        )
+
+        mute_dir = test_root / "mute-repo"
+        make_repo(mute_dir)
+        write_file(mute_dir / "only.tmp", "only\n")
+        status, added_mute = http_call(
+            "POST", base, "/api/repos", {"paths": [str(mute_dir)]}
+        )
+        mute_id = ((added_mute or {}).get("results") or [{}])[0].get("repo_id")
+        status, muted_result = http_call(
+            "POST", base, f"/api/repos/{mute_id}/mutes", {"patterns": ["only.tmp"]}
+        )
+        muted_result = muted_result or {}
+        muted_status = muted_result.get("status") or {}
+        muted_dirty = muted_status.get("dirty") or {}
+        muted_files = (muted_status.get("files") or {}).get("untracked") or []
+        check(
+            "静音后计数分离且文件标记 muted=true",
+            status == 200 and muted_dirty.get("total", 0) > 0
+            and muted_dirty.get("pending") == 0 and muted_dirty.get("muted") == 1
+            and any(item.get("path") == "only.tmp" and item.get("muted") is True for item in muted_files),
+            f"dirty={muted_dirty}",
+        )
+        check(
+            "静音不会把仓库误判为干净（total 与静音数保留）",
+            muted_dirty.get("total", 0) >= 1 and muted_dirty.get("muted") == 1
+            and muted_status.get("ignore", {}).get("counts", {}).get("muted") == 1,
+            f"total={muted_dirty.get('total')} muted={muted_dirty.get('muted')}",
+        )
+        status, changes_muted = http_call("GET", base, f"/api/repos/{mute_id}/changes")
+        muted_change = next(
+            (item for item in (changes_muted or {}).get("files") or [] if item.get("path") == "only.tmp"),
+            {},
+        )
+        check(
+            "提交面板仍能看到静音文件（不影响提交正确性）",
+            status == 200 and muted_change.get("muted") is True
+            and muted_change.get("group") == "untracked"
+            and ((changes_muted or {}).get("counts") or {}).get("untracked", 0) >= 1,
+            f"group={muted_change.get('group')}",
+        )
+        status, unmuted = http_call(
+            "DELETE", base, f"/api/repos/{mute_id}/mutes/{muted_result.get('mutes', [{}])[0].get('id')}"
+        )
+        unmuted_dirty = ((unmuted or {}).get("status") or {}).get("dirty") or {}
+        check(
+            "取消静音后待处理计数恢复",
+            status == 200 and unmuted_dirty.get("muted") == 0
+            and unmuted_dirty.get("pending") == 1,
+            f"dirty={unmuted_dirty}",
+        )
+
+        status, untrack_reject = http_call(
+            "POST", base, f"/api/repos/{ignore_id}/untrack",
+            {"paths": ["tracked.tmp"], "confirm": False},
+        )
+        check(
+            "取消跟踪未确认时被拒绝",
+            status == 400 and (untrack_reject or {}).get("code") == "confirm_required",
+            str((untrack_reject or {}).get("message")),
+        )
+        status, untracked_result = http_call(
+            "POST", base, f"/api/repos/{ignore_id}/untrack",
+            {"paths": ["tracked.tmp"], "confirm": True},
+        )
+        untracked_result = untracked_result or {}
+        disk_exists = (ignore_dir / "tracked.tmp").is_file()
+        staged_paths = [
+            item.get("path") for item in ((untracked_result.get("status") or {}).get("files") or {}).get("staged") or []
+        ]
+        check(
+            "git rm --cached 后文件仍在磁盘且变为已删除待提交",
+            status == 200 and disk_exists and "tracked.tmp" in staged_paths
+            and untracked_result.get("needs_commit") is True,
+            f"exists={disk_exists} staged={staged_paths}",
+        )
+        status, untrack_audit = http_call(
+            "GET", base, f"/api/audit?page=1&page_size=10&action=untrack&repo_id={ignore_id}"
+        )
+        check(
+            "取消跟踪写入审计（action=untrack）",
+            status == 200 and ((untrack_audit or {}).get("items") or []) != []
+            and ((untrack_audit or {}).get("items") or [{}])[0].get("action") == "untrack",
+            f"items={len((untrack_audit or {}).get('items') or [])}",
+        )
+
+        # ---------- 12.8 远端错误分类器与地址转换 ----------
+        forbidden = classify_remote_error(
+            "remote: Permission to lemomo-ai/lemo-opuscar.git denied to ZeroOneCN.\n"
+            "fatal: unable to access 'https://github.com/lemomo-ai/lemo-opuscar.git/': "
+            "The requested URL returned error: 403"
+        ) or {}
+        check(
+            "403 归因解析出 owner/repo 与被拒账号",
+            forbidden.get("code") == "http_403_forbidden"
+            and "lemomo-ai/lemo-opuscar.git" in (forbidden.get("detail") or "")
+            and "ZeroOneCN" in (forbidden.get("detail") or "")
+            and any(item.get("key") == "use_ssh" for item in forbidden.get("suggestions") or []),
+            str(forbidden.get("title")),
+        )
+        check(
+            "401 认证失败归类为凭据无效",
+            (classify_remote_error("fatal: Authentication failed for 'https://example.com/repo.git/'") or {}).get("code")
+            == "http_401_auth",
+            "",
+        )
+        check(
+            "SSH 主机密钥问题归类为 ssh_host_key",
+            (classify_remote_error("Host key verification failed.\nfatal: Could not read from remote repository.") or {}).get("code")
+            == "ssh_host_key",
+            "",
+        )
+        check(
+            "SSH 公钥被拒归类为 ssh_publickey",
+            (classify_remote_error("git@github.com: Permission denied (publickey).") or {}).get("code")
+            == "ssh_publickey",
+            "",
+        )
+        check(
+            "non-fast-forward 归类为推送被拒",
+            (classify_remote_error("! [rejected] main -> main (non-fast-forward)") or {}).get("code")
+            == "push_rejected",
+            "",
+        )
+        check(
+            "网络连接失败归类为 network_error",
+            (classify_remote_error("fatal: unable to access 'https://x/': Failed to connect to x port 443") or {}).get("code")
+            == "network_error",
+            "",
+        )
+        ssh_github = https_to_ssh("https://github.com/lemomo-ai/lemo-opuscar.git")
+        ssh_gitee = https_to_ssh("https://gitee.com/owner/repo")
+        ssh_gitlab = https_to_ssh("https://gitlab.com/group/sub/repo.git")
+        ssh_same = https_to_ssh("git@github.com:owner/repo.git")
+        ssh_other = https_to_ssh("https://git.example.com/owner/repo.git")
+        check(
+            "HTTPS→SSH 转换覆盖 github/gitee/gitlab 且保留 .git 后缀",
+            ssh_github.get("ssh_url") == "git@github.com:lemomo-ai/lemo-opuscar.git"
+            and ssh_gitee.get("ssh_url") == "git@gitee.com:owner/repo"
+            and ssh_gitlab.get("ssh_url") == "git@gitlab.com:group/sub/repo.git",
+            f"github={ssh_github.get('ssh_url')} gitee={ssh_gitee.get('ssh_url')}",
+        )
+        check(
+            "已是 SSH 或非主流域名时拒绝转换",
+            ssh_same.get("ok") is False and ssh_other.get("ok") is False,
+            f"same={ssh_same.get('reason')} other={ssh_other.get('reason')}",
+        )
+        check(
+            "远端协议识别 https / ssh / local",
+            detect_remote_protocol("https://github.com/a/b.git") == "https"
+            and detect_remote_protocol("git@github.com:a/b.git") == "ssh"
+            and detect_remote_protocol(r"E:\Code\repo") == "local",
+            "",
+        )
+        parsed_credentials = parse_cmdkey_output(
+            "目标: git:https://github.com\nTarget: LegacyGeneric:target=git:https://gitee.com\n"
+            "目标: git:https://github.com\n"
+        )
+        check(
+            "cmdkey 输出解析出 git HTTPS 条目并去重",
+            [item.get("target") for item in parsed_credentials]
+            == ["git:https://github.com", "git:https://gitee.com"],
+            str(parsed_credentials),
+        )
+
+        err_dir = test_root / "error-repo"
+        make_repo(err_dir)
+        run_git(git_exe, ["remote", "add", "origin", "https://127.0.0.1:1/nope.git"], cwd=err_dir)
+        head_sha = run_git(git_exe, ["rev-parse", "HEAD"], cwd=err_dir).stdout.strip()
+        run_git(git_exe, ["update-ref", "refs/remotes/origin/main", head_sha], cwd=err_dir)
+        run_git(git_exe, ["config", "branch.main.remote", "origin"], cwd=err_dir)
+        run_git(git_exe, ["config", "branch.main.merge", "refs/heads/main"], cwd=err_dir)
+        status, added_error = http_call(
+            "POST", base, "/api/repos", {"paths": [str(err_dir)]}
+        )
+        err_id = ((added_error or {}).get("results") or [{}])[0].get("repo_id")
+        status, push_failed = http_call("POST", base, f"/api/repos/{err_id}/push", {})
+        push_failed = push_failed or {}
+        payload = push_failed
+        check(
+            "推送网络失败返回结构化诊断且保留原始输出",
+            status == 502 and isinstance(payload.get("diagnosis"), dict)
+            and payload["diagnosis"].get("code") == "network_error"
+            and (payload.get("output") or "").strip() != ""
+            and "push" in (payload.get("command") or ""),
+            f"code={(payload.get('diagnosis') or {}).get('code')}",
+        )
+
+        status, credentials = http_call("GET", base, "/api/credentials")
+        before_targets = [item.get("target") for item in (credentials or {}).get("items") or []]
+        check(
+            "HTTPS 凭据面板仅返回 host 与目标（不返回密码）",
+            status == 200 and isinstance((credentials or {}).get("items"), list)
+            and all("target" in item and "host" in item and "password" not in item
+                    for item in (credentials or {}).get("items") or []),
+            f"items={len(before_targets)}",
+        )
+        status, invalid_delete = http_call(
+            "POST", base, "/api/credentials/delete",
+            {"target": "https://github.com", "confirm": True},
+        )
+        check(
+            "非 git: 前缀的凭据目标被拒绝",
+            status == 400 and (invalid_delete or {}).get("code") == "invalid_credential_target",
+            str((invalid_delete or {}).get("message")),
+        )
+        status, test_delete = http_call(
+            "POST", base, "/api/credentials/delete",
+            {"target": "git:https://gitmanager-selftest.invalid", "confirm": True},
+        )
+        status, credentials_after = http_call("GET", base, "/api/credentials")
+        after_targets = [item.get("target") for item in (credentials_after or {}).get("items") or []]
+        check(
+            "清除测试 target 不影响任何真实凭据",
+            before_targets == after_targets,
+            f"before={len(before_targets)} after={len(after_targets)} delete_status={status}",
+        )
+        status, login_reject = http_call(
+            "POST", base, "/api/credentials/login", {"confirm": False}
+        )
+        check(
+            "交互式登录未确认时被拒绝（不会启动外部窗口）",
+            status == 400 and (login_reject or {}).get("code") == "confirm_required",
+            str((login_reject or {}).get("message")),
+        )
+
+        convert_dir = test_root / "convert-repo"
+        make_repo(convert_dir)
+        run_git(
+            git_exe,
+            ["remote", "add", "origin", "https://github.com/lemomo-ai/lemo-opuscar.git"],
+            cwd=convert_dir,
+        )
+        status, added_convert = http_call(
+            "POST", base, "/api/repos", {"paths": [str(convert_dir)]}
+        )
+        convert_id = ((added_convert or {}).get("results") or [{}])[0].get("repo_id")
+        status, ssh_preview = http_call(
+            "POST", base, f"/api/repos/{convert_id}/remote/ssh/preview",
+            {"remote": "origin"},
+        )
+        ssh_preview = ssh_preview or {}
+        check(
+            "远端 SSH 转换预览给出目标地址",
+            status == 200 and ssh_preview.get("fetch_convertible") is True
+            and ssh_preview.get("ssh_fetch_url") == "git@github.com:lemomo-ai/lemo-opuscar.git",
+            str(ssh_preview.get("ssh_fetch_url")),
+        )
+        status, converted = http_call(
+            "POST", base, f"/api/repos/{convert_id}/remote/ssh",
+            {"remote": "origin", "mode": "both", "confirm": True},
+        )
+        status, converted_remotes = http_call("GET", base, f"/api/repos/{convert_id}/remotes")
+        remote_items = (converted_remotes or {}).get("remotes") or []
+        check(
+            "切换后 fetch/push 地址变为 SSH 且状态协议为 ssh",
+            status == 200 and remote_items and remote_items[0].get("fetch_url", "").startswith("git@github.com:")
+            and remote_items[0].get("push_url", "").startswith("git@github.com:")
+            and ((converted or {}).get("status") or {}).get("remote_info", {}).get("protocol") == "ssh",
+            str(remote_items),
+        )
+        status, ssh_preview_again = http_call(
+            "POST", base, f"/api/repos/{convert_id}/remote/ssh/preview",
+            {"remote": "origin"},
+        )
+        check(
+            "已是 SSH 地址时不再重复转换",
+            status == 200 and (ssh_preview_again or {}).get("fetch_convertible") is False
+            and "已经是 SSH" in ((ssh_preview_again or {}).get("reason") or ""),
+            str((ssh_preview_again or {}).get("reason")),
         )
 
         # ---------- 13. 仓库扫描（只读、跳过噪音、深度与结果上限） ----------

@@ -22,7 +22,7 @@ from .db import Database
 from .git_runner import GitExecutor
 from .services import ApiError, GitManagerService
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_DIR = Path(__file__).resolve().parent
 
 settings: Settings = load_settings()
@@ -194,6 +194,54 @@ class CommitRequest(BaseModel):
 
     files: list[str] = Field(..., min_length=1, max_length=1000, description="勾选的文件路径")
     message: str = Field(..., min_length=1, max_length=5000, description="提交信息")
+
+
+class IgnoreRequest(BaseModel):
+    """写入 .gitignore 预览/追加请求。"""
+
+    paths: list[str] = Field(..., min_length=1, max_length=500, description="待忽略的路径")
+    note: str = Field("", max_length=200, description="可选备注（写入审计摘要）")
+
+
+class MuteRequest(BaseModel):
+    """本地静音请求。"""
+
+    patterns: list[str] = Field(..., min_length=1, max_length=200, description="路径或通配规则")
+    note: str = Field("", max_length=200, description="可选备注")
+
+
+class UntrackRequest(BaseModel):
+    """取消跟踪（git rm --cached）请求。"""
+
+    paths: list[str] = Field(..., min_length=1, max_length=200, description="已跟踪的路径")
+    confirm: bool = Field(False, description="危险操作二次确认标记")
+
+
+class RemoteSshPreviewRequest(BaseModel):
+    """远端 HTTPS→SSH 预览请求。"""
+
+    remote: str = Field("", max_length=100, description="远端名称；空表示默认远端")
+
+
+class RemoteSshRequest(BaseModel):
+    """远端地址切换为 SSH 请求。"""
+
+    remote: str = Field("", max_length=100, description="远端名称")
+    mode: str = Field("both", description="both / push / fetch")
+    confirm: bool = Field(False, description="修改配置的确认标记")
+
+
+class CredentialDeleteRequest(BaseModel):
+    """清除 HTTPS 凭据请求。"""
+
+    target: str = Field(..., min_length=1, max_length=500, description="cmdkey 目标，如 git:https://github.com")
+    confirm: bool = Field(False, description="清除凭据的确认标记")
+
+
+class CredentialLoginRequest(BaseModel):
+    """交互式凭据登录请求。"""
+
+    confirm: bool = Field(False, description="打开外部窗口的确认标记")
 
 
 class AllowedRootRequest(BaseModel):
@@ -557,6 +605,171 @@ def commit_repo(repo_id: int, payload: CommitRequest) -> dict[str, Any]:
         提交结果与新提交信息。
     """
     return service.commit_repository(repo_id, payload.files, payload.message)
+
+
+# ----------------------------------------------------------------------
+# 忽略归因 / 本地静音 / 取消跟踪 / 远端协议 / HTTPS 凭据
+# ----------------------------------------------------------------------
+
+
+@app.get("/api/repos/{repo_id}/ignore")
+def repo_ignore_report(repo_id: int) -> dict[str, Any]:
+    """返回忽略归因报告：可忽略、已跟踪但命中规则、规则来源与静音项。
+
+    参数：
+        repo_id: 仓库主键。
+    返回值：
+        {repo, files, counts, mutes, gitignore}。
+    """
+    return service.ignore_report(repo_id)
+
+
+@app.post("/api/repos/{repo_id}/ignore/preview")
+def repo_ignore_preview(repo_id: int, payload: IgnoreRequest) -> dict[str, Any]:
+    """生成 .gitignore 追加预览（不写入文件）。
+
+    参数：
+        repo_id: 仓库主键。
+        payload: 待忽略路径与备注。
+    返回值：
+        规则建议、目标文件、追加内容与完整预览。
+    """
+    return service.preview_ignore(repo_id, payload.paths)
+
+
+@app.post("/api/repos/{repo_id}/ignore")
+def repo_ignore_append(repo_id: int, payload: IgnoreRequest) -> dict[str, Any]:
+    """把规则追加到仓库根 .gitignore（重复规则跳过），并返回刷新后的状态。
+
+    参数：
+        repo_id: 仓库主键。
+        payload: 待忽略路径与备注。
+    返回值：
+        {ok, target, appended, skipped, message, status}。
+    """
+    return service.append_ignore(repo_id, payload.paths, payload.note)
+
+
+@app.get("/api/repos/{repo_id}/mutes")
+def repo_mutes(repo_id: int) -> dict[str, Any]:
+    """列出本地静音规则与当前静音计数。
+
+    参数：
+        repo_id: 仓库主键。
+    返回值：
+        {mutes, counts}。
+    """
+    report = service.ignore_report(repo_id)
+    return {"mutes": report["mutes"], "counts": report["counts"]}
+
+
+@app.post("/api/repos/{repo_id}/mutes")
+def repo_add_mutes(repo_id: int, payload: MuteRequest) -> dict[str, Any]:
+    """新增本地静音规则（只影响看板，不修改仓库文件）。
+
+    参数：
+        repo_id: 仓库主键。
+        payload: 路径/规则与备注。
+    返回值：
+        {ok, added, skipped, mutes, message, status}。
+    """
+    return service.add_mutes(repo_id, payload.patterns, payload.note)
+
+
+@app.delete("/api/repos/{repo_id}/mutes/{mute_id}")
+def repo_remove_mute(repo_id: int, mute_id: int) -> dict[str, Any]:
+    """取消一条本地静音规则。
+
+    参数：
+        repo_id: 仓库主键。
+        mute_id: 静音规则主键。
+    返回值：
+        {ok, removed, mutes, message, status}。
+    """
+    return service.remove_mute(repo_id, mute_id)
+
+
+@app.post("/api/repos/{repo_id}/untrack")
+def repo_untrack(repo_id: int, payload: UntrackRequest) -> dict[str, Any]:
+    """取消跟踪（git rm --cached），保留磁盘文件，不自动提交。
+
+    参数：
+        repo_id: 仓库主键。
+        payload: 路径列表与二次确认标记。
+    返回值：
+        {ok, removed, needs_commit, message, status}。
+    """
+    return service.untrack_paths(repo_id, payload.paths, payload.confirm)
+
+
+@app.post("/api/repos/{repo_id}/remote/ssh/preview")
+def repo_remote_ssh_preview(
+    repo_id: int, payload: RemoteSshPreviewRequest
+) -> dict[str, Any]:
+    """预览远端地址的 HTTPS→SSH 转换结果（不修改配置）。
+
+    参数：
+        repo_id: 仓库主键。
+        payload: 远端名称。
+    返回值：
+        当前 fetch/push 地址与目标 SSH 地址。
+    """
+    return service.preview_remote_ssh(repo_id, payload.remote)
+
+
+@app.post("/api/repos/{repo_id}/remote/ssh")
+def repo_remote_ssh(repo_id: int, payload: RemoteSshRequest) -> dict[str, Any]:
+    """把远端地址切换为 SSH（需确认，执行 git remote set-url 并审计）。
+
+    参数：
+        repo_id: 仓库主键。
+        payload: 远端名称、模式（both/push/fetch）与确认标记。
+    返回值：
+        {ok, remote, mode, fetch_url, push_url, message, status}。
+    """
+    return service.convert_remote_ssh(
+        repo_id, payload.remote, payload.mode, payload.confirm
+    )
+
+
+@app.get("/api/credentials")
+def list_credentials() -> dict[str, Any]:
+    """列出 Windows 凭据管理器中的 git HTTPS 条目（不展示密码）。
+
+    参数：
+        无。
+    返回值：
+        {ok, items, raw, message}。
+    """
+    return service.list_https_credentials()
+
+
+@app.post("/api/credentials/delete")
+def delete_credential(payload: CredentialDeleteRequest) -> dict[str, Any]:
+    """清除指定 host 的 git HTTPS 凭据（需显式确认）。
+
+    参数：
+        payload: cmdkey 目标与确认标记。
+    返回值：
+        {ok, target, message}。
+    """
+    if not payload.confirm:
+        raise ApiError(
+            "confirm_required", "清除凭据需要显式确认（下次推送会要求重新登录）。", 400
+        )
+    return service.delete_https_credential(payload.target)
+
+
+@app.post("/api/credentials/login")
+def login_credential(payload: CredentialLoginRequest) -> dict[str, Any]:
+    """在独立控制台窗口启动 Git Credential Manager 交互式登录。
+
+    参数：
+        payload: 确认标记。
+    返回值：
+        {ok, installed, launched, message, install_url}。
+    """
+    return service.login_https_credential(payload.confirm)
 
 
 # ----------------------------------------------------------------------

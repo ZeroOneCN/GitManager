@@ -202,6 +202,8 @@ class GitExecutor:
         args: list[str],
         forced: bool = False,
         ssh_identity: dict[str, Any] | None = None,
+        record_audit: bool = True,
+        input_text: str | None = None,
     ) -> GitResult:
         """执行一次 git 命令并自动记录审计。
 
@@ -212,6 +214,10 @@ class GitExecutor:
             args: 传给 git 的参数数组（不包含 git 本身）。
             forced: 是否属于强制类操作，用于审计标记。
             ssh_identity: 可选 SSH 身份，仅网络类动作注入 GIT_SSH_COMMAND。
+            record_audit: 是否写入审计；只读诊断探测（如 check-ignore）可置 False，
+                避免把正常返回码 1 的探测记成失败记录。
+            input_text: 需要写入 stdin 的文本（如 check-ignore --stdin 的 NUL 分隔路径）；
+                为 None 时使用 DEVNULL，避免任何交互式阻塞。
         返回值：
             GitResult，包含退出码、输出、耗时与展示用命令。
         """
@@ -225,18 +231,21 @@ class GitExecutor:
         error_text = ""
 
         try:
-            completed = subprocess.run(
-                [self.git_executable, *args],
-                cwd=path_text,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.timeout_seconds,
-                shell=False,
-                stdin=subprocess.DEVNULL,
-                env=self._build_env(ssh_identity),
-            )
+            run_kwargs: dict[str, Any] = {
+                "cwd": path_text,
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "timeout": self.timeout_seconds,
+                "shell": False,
+                "env": self._build_env(ssh_identity),
+            }
+            if input_text is None:
+                run_kwargs["stdin"] = subprocess.DEVNULL
+            else:
+                run_kwargs["input"] = input_text
+            completed = subprocess.run([self.git_executable, *args], **run_kwargs)
             exit_code = int(completed.returncode)
             stdout = completed.stdout or ""
             stderr = completed.stderr or ""
@@ -256,18 +265,19 @@ class GitExecutor:
         summary = self._summarize(stdout, stderr)
         if error_text and not summary:
             summary = error_text
-        self._write_audit(
-            repo_id=repo_id,
-            repo_path=path_text,
-            action=action,
-            command=command_text,
-            exit_code=exit_code,
-            ok=ok,
-            duration_ms=duration_ms,
-            forced=forced,
-            summary=summary,
-            identity_name=(ssh_identity or {}).get("name"),
-        )
+        if record_audit:
+            self._write_audit(
+                repo_id=repo_id,
+                repo_path=path_text,
+                action=action,
+                command=command_text,
+                exit_code=exit_code,
+                ok=ok,
+                duration_ms=duration_ms,
+                forced=forced,
+                summary=summary,
+                identity_name=(ssh_identity or {}).get("name"),
+            )
 
         return GitResult(
             ok=ok,

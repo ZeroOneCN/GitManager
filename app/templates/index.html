@@ -39,6 +39,9 @@
         <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><circle cx="11" cy="11" r="6" fill="none" stroke="currentColor" stroke-width="2"></circle><path d="M16 16l5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path></svg>
         <span>扫描仓库</span>
       </button>
+      <button class="btn btn-ghost" id="btn-credentials" title="查看与清理 Windows 中缓存的 git HTTPS 凭据">
+        <span>HTTPS 凭据</span>
+      </button>
       <button class="btn btn-ghost" id="btn-refresh" title="读取所有仓库的最新本地状态">
         <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path></svg>
         <span>刷新全部</span>
@@ -53,6 +56,7 @@
   <main class="app-main">
     <section id="view-dashboard" class="view">
       <div class="summary-strip" id="summary-strip"></div>
+      <div class="summary-note" id="summary-note" hidden></div>
       <div class="identity-strip" id="identity-strip" hidden></div>
       <div class="repo-grid" id="repo-grid"></div>
       <div class="empty-state" id="empty-state" hidden>

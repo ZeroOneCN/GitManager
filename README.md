@@ -54,7 +54,28 @@
 | F15 | 自研弹窗体系 | 全局禁用 `window.confirm/alert/prompt`；弹窗硬上限 480px（默认 420px），内容区自滚动；焦点陷阱、ESC/遮罩关闭、焦点归还、`aria-modal`、背景滚动锁定；危险操作语义红 |
 | F16 | URL 与长文本完整展示 | 顶部显示完整服务地址并可复制；仓库远端、SSH 私钥路径、Host 别名、根目录路径完整换行展示，不省略号截断，均提供复制 |
 
-### 1.6 里程碑与时间计划（2026-11-04）
+### 1.6 第四期与第五期范围（2026-11-04 追加，In Scope）
+
+**第四期：未忽略的未跟踪文件“一直待处理”体验治理**
+
+| 编号 | 功能 | 说明 |
+| --- | --- | --- |
+| F17 | 忽略归因诊断 | 对每个脏文件区分 `untracked_ignorable`（未被规则匹配）/ `rule_matched`（命中规则但仍在看板）/ `tracked_ignored`（已跟踪且命中 ignore）/ `dirty_tracked`；`check-ignore --no-index -v -z` 的规则来源（文件:行号:规则）原样展示 |
+| F18 | 写入 .gitignore | 多选文件 → 规则建议（文件 `/path`、目录 `dir/`）→ 预览目标文件与追加内容 → 确认后二进制追加；保留 BOM/换行风格、无末尾换行自动补、等价规则不重复 |
+| F19 | 仅本地静音 | DB `ignored_paths`（仓库ID + 模式 + 创建时间 + 备注）；只影响看板待处理判定与计数，接口标记 `muted=true`，不改变仓库与提交；看板折叠“已静音的变更(N)”可展开/取消，顶部给出“含静音项未处理”次级提示 |
+| F20 | 取消跟踪 | `git rm --cached` 危险二次确认（写明“从版本库移除但保留磁盘文件”并列出路径）；仅对“已跟踪 + 命中 ignore”或用户显式选择出现；执行后审计并提示需另行提交删除变更（不自动提交） |
+| F21 | 看板聚合 | 顶部区分 `待处理变更数` / `已静音数` / `已跟踪但被 ignore`；卡片新增“忽略规则（N）”入口；动作后自动刷新并审计 `ignore_append` / `mute` / `untrack` |
+
+**第五期：远端推送失败的结构化归因（真实故障修复）**
+
+| 编号 | 功能 | 说明 |
+| --- | --- | --- |
+| F22 | 远端错误分类器 | `classify_remote_error` 覆盖 403（解析 owner/repo 与被拒账号）、401/认证失败、SSH host key / publickey、网络层、non-fast-forward / protected branch；返回 `{code,title,detail,suggestions[]}`，原始输出完整保留可展开复制 |
+| F23 | 远端协议与身份生效 | 状态接口解析 `remote -v` 识别 `https/ssh/local` 并在卡片显示徽标；HTTPS 远端但已配置 SSH 身份时提示“SSH 身份对该仓库不生效”；支持 HTTPS→SSH 地址转换（仅 github/gitee/gitlab，弹窗显示当前/目标值，可选 fetch/push/两者，写审计） |
+| F24 | HTTPS 凭据入口 | 解析 `cmdkey /list` 的 `git:https://host` 条目（只展示 host 与目标，不展示密码）；支持二次确认后清除该 host 凭据；提供独立新窗口的 `git-credential-manager login` 交互登录；未安装 GCM 明确提示并给安装地址 |
+
+### 1.7 里程碑与时间计划（2026-11-04）
+
 
 | 里程碑 | 内容 | 计划完成 |
 | --- | --- | --- |
@@ -72,6 +93,10 @@
 | M12 | 第三期 P0 提交缺陷修复与状态模型扩展 | 2026-11-04 21:10 |
 | M13 | 审计真分页 + 自研弹窗 + URL 完整展示 | 2026-11-04 21:50 |
 | M14 | 第三期自测（后端 125 项 + UI 24 项）与文档回写、本地提交（**严禁 push**） | 2026-11-04 22:20 |
+| M15 | 第四期后端：忽略归因、`ignored_paths`、.gitignore 追加、取消跟踪 | 2026-11-04 22:55 |
+| M16 | 第四期前端：三分计数、忽略规则面板、静音折叠与三个动作弹窗 | 2026-11-04 23:05 |
+| M17 | 第五期后端/前端：远端错误分类器、协议徽标、SSH 转换、HTTPS 凭据面板 | 2026-11-04 23:20 |
+| M18 | 第四/五期自测（160 项 + UI 34 项）、文档回写与本地提交（**严禁 push**） | 2026-11-04 23:40 |
 
 ---
 
@@ -131,3 +156,7 @@
 | 2026-11-04 21:10 | M12 第三期后端修复 | ✅ | 状态解析新增 `deleted` 分组；状态/暂存/提交命令统一 `-c core.quotepath=false`，子进程 UTF-8 解码；暂存改为 `git add -A -- <pathspec>`；提交失败原样返回命令/退出码/输出；审计接口支持 `page/page_size` 服务端分页（保留旧 `limit/offset` 兼容） |
 | 2026-11-04 21:50 | M13 第三期前端体验 | ✅ | 审计首页/末页/页码跳转与筛选保持；自研确认层与全部原生对话框替换；弹窗宽度 420/480px、内容区 60vh 自滚动、焦点陷阱/ESC/焦点归还；顶部完整服务地址、远端/私钥/Host/根路径完整展示并可复制 |
 | 2026-11-04 22:20 | M14 第三期验收 | ✅ | `scripts/selftest.py` **125/125 PASS**（原 105 项保留 + 新增 20 项）；`tests/ui_phase3_check.py` **24/24 PASS**；`tests/ui_layout_check.py` **15/15 PASS**；8765 服务重启并核验 `/api/health`、首页、审计分页 |
+| 2026-11-04 23:00 | M15 第四期后端 | ✅ | `db.py` 新增 `ignored_paths` 表与 CRUD、`last_push_failure`；`services.py` 新增 `_read_tracked_paths` / `_read_ignore_hits`（`check-ignore --no-index -v -z --stdin`，按 4 字段解析）/ `_diagnose_dirty`；`ignore_report`、`preview_ignore` / `append_ignore`（二进制追加、保留 BOM/换行、等价规则去重）、`add_mutes` / `remove_mute`、`untrack_paths`（`git rm --cached` + 审计） |
+| 2026-11-04 23:10 | M16 第四期前端 | ✅ | 顶部 8 项统计新增“待处理变更数 / 已静音数 / 已跟踪但被 ignore”；卡片“忽略规则（N）”面板四分组 + 三个动作；静音折叠 `details.muted-details` + 取消静音；`window.__nativeDialogCalls` 全程 0 |
+| 2026-11-04 23:25 | M17 第五期远端诊断 | ✅ | `domain.py` 新增 `classify_remote_error`（403/401/SSH/网络/分支策略）、`detect_remote_protocol`、`https_to_ssh`、`parse_cmdkey_output`；`services.py` 新增 `_remote_info`、远端 SSH 转换、`cmdkey` 凭据列表/清除、交互式 GCM 登录；前端诊断卡片、协议徽标、HTTPS 凭据面板 |
+| 2026-11-04 23:35 | M18 第四/五期验收 | ✅ | `scripts/selftest.py` **160/160 PASS**（原 125 项保留 + 新增 35 项）；`tests/ui_phase3_check.py` **34/34 PASS**（原 24 项 + 静音折叠/三类计数/忽略面板 10 项）；8765 以 v1.3.0 重启并核验 `/api/health`、`/api/repos/{id}/ignore` |

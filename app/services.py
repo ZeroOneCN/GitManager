@@ -9,15 +9,27 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import os
+import re
+import shutil
 import sqlite3
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .config import Settings, path_is_under
 from .db import Database, now_iso
-from .domain import map_git_error, parse_ahead_behind, parse_status_porcelain_z
+from .domain import (
+    classify_remote_error,
+    detect_remote_protocol,
+    https_to_ssh,
+    map_git_error,
+    parse_ahead_behind,
+    parse_cmdkey_output,
+    parse_status_porcelain_z,
+)
 from .git_runner import GitExecutor, GitResult
 from .scanner import ScanManager
 from .ssh_service import SshService
@@ -79,6 +91,17 @@ def _error_from_result(
         "command": result.command,
         "exit_code": result.exit_code,
     }
+    # 远端类失败附加结构化诊断；原始输出仍完整保留在 output 字段
+    diagnosis = classify_remote_error(result.stderr, result.stdout)
+    if diagnosis:
+        payload["diagnosis"] = diagnosis
+        diag_code = diagnosis["code"]
+        if diag_code.startswith("http_403"):
+            status_code = 403
+        elif diag_code.startswith("http_401"):
+            status_code = 401
+        elif diag_code.startswith("ssh_") or diag_code == "network_error":
+            status_code = 502
     if extra:
         payload.update(extra)
     return ApiError(code, message, status_code, payload)
@@ -97,6 +120,47 @@ def _iso_from_mtime(path: Path) -> str | None:
     except OSError:
         return None
     return datetime.fromtimestamp(stamp).astimezone().isoformat(timespec="seconds")
+
+
+def _rel_to_repo(repo_path: str, raw: str) -> str:
+    """把任意路径规范化为仓库内相对路径（统一正斜杠、去掉仓库根前缀）。
+
+    参数：
+        repo_path: 仓库根目录。
+        raw: 原始路径（可能为绝对路径或 git 输出的相对路径）。
+    返回值：
+        相对仓库根的正斜杠路径（不带前导斜杠）。
+    """
+    text = (raw or "").replace("\\", "/").strip()
+    root = (repo_path or "").replace("\\", "/").rstrip("/")
+    if root and text.lower().startswith(root.lower() + "/"):
+        text = text[len(root) + 1:]
+    return text.lstrip("/")
+
+
+def _mute_matches(pattern: str, path: str) -> bool:
+    """判断路径是否命中本地静音规则（支持精确路径、目录前缀与通配符）。
+
+    参数：
+        pattern: 数据库中保存的模式（例如 "dist/"、"*.log"、"docs/a.md"）。
+        path: 仓库内相对路径。
+    返回值：
+        命中返回 True。比较时忽略大小写，以适配 Windows。
+    """
+    rule = (pattern or "").replace("\\", "/").strip()
+    target = (path or "").replace("\\", "/").strip()
+    if not rule or not target:
+        return False
+    if rule.startswith("/"):
+        rule = rule[1:]
+    lowered_rule = rule.lower()
+    lowered_target = target.lower()
+    if rule.endswith("/"):
+        base = lowered_rule.rstrip("/")
+        return lowered_target == base or lowered_target.startswith(base + "/")
+    if any(ch in rule for ch in "*?["):
+        return fnmatch.fnmatchcase(lowered_target, lowered_rule)
+    return lowered_target == lowered_rule
 
 
 class GitManagerService:
@@ -842,6 +906,226 @@ class GitManagerService:
             raise _error_from_result("status", result)
         return parse_status_porcelain_z(result.stdout)
 
+    # ------------------------------------------------------------------
+    # 忽略规则诊断与本地静音
+    # ------------------------------------------------------------------
+
+    def _read_tracked_paths(self, repo: dict[str, Any]) -> set[str]:
+        """读取仓库索引中已跟踪的路径集合（小写、正斜杠，便于比较）。
+
+        参数：
+            repo: 仓库字典。
+        返回值：
+            已跟踪路径集合；读取失败时返回空集合。
+        """
+        result = self.executor.run(
+            repo["id"],
+            repo["path"],
+            "ls_files",
+            [*QUOTEPATH_ARGS, "ls-files", "-z"],
+            record_audit=False,
+        )
+        if not result.ok:
+            return set()
+        return {
+            _rel_to_repo(repo["path"], token).lower()
+            for token in result.stdout.split("\x00")
+            if token
+        }
+
+    def _read_ignore_hits(
+        self, repo: dict[str, Any], paths: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """批量查询忽略规则命中情况（含规则来源与行号）。
+
+        参数：
+            repo: 仓库字典。
+            paths: 仓库内相对路径列表（已去重）。
+        返回值：
+            {小写路径: {source_file, line, pattern, source}}；
+            source 形如 ".gitignore:12:*.log"，原样供前端展示。
+        """
+        hits: dict[str, dict[str, Any]] = {}
+        unique = [item for item in dict.fromkeys(paths) if item]
+        for start in range(0, len(unique), 200):
+            chunk = unique[start:start + 200]
+            result = self.executor.run(
+                repo["id"],
+                repo["path"],
+                "check_ignore",
+                [
+                    *QUOTEPATH_ARGS,
+                    "check-ignore",
+                    "--no-index",
+                    "-v",
+                    "-z",
+                    "--stdin",
+                ],
+                record_audit=False,
+                input_text="\x00".join(chunk) + "\x00",
+            )
+            # -z 输出为四个字段：source、行号、规则、路径，均以 NUL 分隔
+            tokens = result.stdout.split("\x00")
+            index = 0
+            while index + 3 < len(tokens):
+                source_file, line_text, pattern, target = (
+                    tokens[index],
+                    tokens[index + 1],
+                    tokens[index + 2],
+                    tokens[index + 3],
+                )
+                index += 4
+                if not source_file or not target:
+                    continue
+                try:
+                    line = int(line_text)
+                except ValueError:
+                    line = 0
+                key = _rel_to_repo(repo["path"], target).lower()
+                hits[key] = {
+                    "source_file": source_file,
+                    "line": line,
+                    "pattern": pattern,
+                    "source": f"{source_file}:{line}:{pattern}",
+                }
+        return hits
+
+    def _diagnose_dirty(
+        self, repo: dict[str, Any], parsed: dict[str, Any]
+    ) -> dict[str, Any]:
+        """为全部脏文件生成忽略归因与静音标记。
+
+        参数：
+            repo: 仓库字典。
+            parsed: parse_status_porcelain_z 的结构。
+        返回值：
+            {
+              files: [{path, code, groups, tracked, ignored, ignore_source,
+                       diagnosis, muted, mute_id}],
+              counts: {total, pending, muted, tracked_ignored, ignorable, rule_matched},
+              mutes: [{id, pattern, note, created_at}],
+              gitignore_exists: bool
+            }。
+        """
+        ordered: list[dict[str, Any]] = []
+        merged: dict[str, dict[str, Any]] = {}
+        for group in ("staged", "modified", "deleted", "untracked", "conflicts"):
+            for item in parsed.get(group, []):
+                key = _rel_to_repo(repo["path"], item["path"]).lower()
+                entry = merged.get(key)
+                if entry is None:
+                    entry = {
+                        "path": item["path"],
+                        "code": item["code"],
+                        "groups": [],
+                    }
+                    merged[key] = entry
+                    ordered.append(entry)
+                if group not in entry["groups"]:
+                    entry["groups"].append(group)
+                if group == "conflicts":
+                    entry["code"] = item["code"]
+
+        mutes = self.database.list_mutes(int(repo["id"]))
+        tracked = self._read_tracked_paths(repo)
+        # 目录型未跟踪条目（形如 "dir/"）传给 git 时去掉尾部分隔符
+        query_paths = [_rel_to_repo(repo["path"], entry["path"]).rstrip("/") for entry in ordered]
+        hits = self._read_ignore_hits(repo, query_paths)
+
+        files: list[dict[str, Any]] = []
+        counts = {
+            "total": len(ordered),
+            "pending": 0,
+            "muted": 0,
+            "tracked_ignored": 0,
+            "ignorable": 0,
+            "rule_matched": 0,
+        }
+        for entry in ordered:
+            rel = _rel_to_repo(repo["path"], entry["path"])
+            key = rel.lower()
+            is_tracked = key in tracked
+            hit = hits.get(key)
+            is_ignored = hit is not None
+            mute = next(
+                (item for item in mutes if _mute_matches(item["pattern"], rel)),
+                None,
+            )
+
+            if is_tracked and is_ignored:
+                diagnosis = "tracked_ignored"
+            elif is_ignored:
+                diagnosis = "rule_matched"
+            elif not is_tracked:
+                diagnosis = "untracked_ignorable"
+            else:
+                diagnosis = "dirty_tracked"
+
+            record = {
+                "path": entry["path"],
+                "code": entry["code"],
+                "groups": entry["groups"],
+                "tracked": is_tracked,
+                "ignored": is_ignored,
+                "ignore_source": hit["source"] if hit else None,
+                "ignore_pattern": hit["pattern"] if hit else None,
+                "diagnosis": diagnosis,
+                "muted": mute is not None,
+                "mute_id": mute["id"] if mute else None,
+            }
+            files.append(record)
+
+            if mute is None:
+                counts["pending"] += 1
+            else:
+                counts["muted"] += 1
+            if diagnosis == "tracked_ignored":
+                counts["tracked_ignored"] += 1
+            elif diagnosis == "untracked_ignorable":
+                counts["ignorable"] += 1
+            elif diagnosis == "rule_matched":
+                counts["rule_matched"] += 1
+
+        gitignore = Path(repo["path"]) / ".gitignore"
+        return {
+            "files": files,
+            "counts": counts,
+            "mutes": mutes,
+            "gitignore_exists": gitignore.is_file(),
+        }
+
+    def _decorate_files(
+        self, parsed: dict[str, Any], diagnosis: dict[str, Any]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """把忽略归因/静音标记合并回四类文件列表。
+
+        参数：
+            parsed: 状态解析结果。
+            diagnosis: _diagnose_dirty 的返回值。
+        返回值：
+            与 parsed 同结构的文件列表（每项增加 muted / diagnosis / ignore_source）。
+        """
+        info = {
+            _rel_to_repo("", item["path"]).lower(): item
+            for item in diagnosis.get("files", [])
+        }
+        decorated: dict[str, list[dict[str, Any]]] = {}
+        for group in ("staged", "modified", "deleted", "untracked", "conflicts"):
+            decorated[group] = []
+            for item in parsed.get(group, []):
+                key = _rel_to_repo("", item["path"]).lower()
+                extra = info.get(key, {})
+                decorated[group].append(
+                    {
+                        **item,
+                        "muted": bool(extra.get("muted")),
+                        "mute_id": extra.get("mute_id"),
+                        "diagnosis": extra.get("diagnosis"),
+                        "ignore_source": extra.get("ignore_source"),
+                    }
+                )
+        return decorated
+
     def _read_branch(self, repo: dict[str, Any]) -> tuple[str | None, bool, str | None]:
         """读取当前分支、是否 detached、HEAD 短哈希。
 
@@ -957,6 +1241,11 @@ class GitManagerService:
                 "deleted": 0,
                 "untracked": 0,
                 "conflicts": 0,
+                "pending": 0,
+                "muted": 0,
+                "tracked_ignored": 0,
+                "ignorable": 0,
+                "rule_matched": 0,
             },
             "files": {
                 "staged": [],
@@ -966,6 +1255,8 @@ class GitManagerService:
                 "conflicts": [],
             },
             "remotes": [],
+            "remote_info": None,
+            "ignore": {"counts": {}, "mutes": [], "gitignore_exists": False},
             "last_commit": None,
             "last_fetch_at": None,
             "ssh_identity": None,
@@ -996,13 +1287,25 @@ class GitManagerService:
             return base
 
         parsed = parse_status_porcelain_z(status_result.stdout)
+        if parsed["counts"]["total"]:
+            diagnosis = self._diagnose_dirty(repo, parsed)
+            decorated = self._decorate_files(parsed, diagnosis)
+        else:
+            diagnosis = {
+                "files": [],
+                "counts": {"total": 0, "pending": 0, "muted": 0, "tracked_ignored": 0, "ignorable": 0, "rule_matched": 0},
+                "mutes": self.database.list_mutes(int(repo["id"])),
+                "gitignore_exists": (Path(repo["path"]) / ".gitignore").is_file(),
+            }
+            decorated = {group: [] for group in ("staged", "modified", "deleted", "untracked", "conflicts")}
         base["files"] = {
-            "staged": parsed["staged"],
-            "modified": parsed["modified"],
-            "deleted": parsed["deleted"],
-            "untracked": parsed["untracked"],
-            "conflicts": parsed["conflicts"],
+            "staged": decorated["staged"],
+            "modified": decorated["modified"],
+            "deleted": decorated["deleted"],
+            "untracked": decorated["untracked"],
+            "conflicts": decorated["conflicts"],
         }
+        counts = diagnosis["counts"]
         base["dirty"] = {
             "total": parsed["counts"]["total"],
             "staged": parsed["counts"]["staged"],
@@ -1010,6 +1313,16 @@ class GitManagerService:
             "deleted": parsed["counts"]["deleted"],
             "untracked": parsed["counts"]["untracked"],
             "conflicts": parsed["counts"]["conflicts"],
+            "pending": counts.get("pending", 0),
+            "muted": counts.get("muted", 0),
+            "tracked_ignored": counts.get("tracked_ignored", 0),
+            "ignorable": counts.get("ignorable", 0),
+            "rule_matched": counts.get("rule_matched", 0),
+        }
+        base["ignore"] = {
+            "counts": counts,
+            "mutes": diagnosis["mutes"],
+            "gitignore_exists": diagnosis["gitignore_exists"],
         }
 
         base["remotes"] = self._read_remotes(repo)
@@ -1024,7 +1337,80 @@ class GitManagerService:
         base["upstream_status"] = ahead_behind
         base["last_commit"] = self._read_last_commit(repo)
         base["last_fetch_at"] = self._read_last_fetch(repo)
+        base["remote_info"] = self._remote_info(
+            repo, base["remotes"], base["upstream"], base["ssh_identity"]
+        )
         return base
+
+    def _remote_info(
+        self,
+        repo: dict[str, Any],
+        remotes: list[dict[str, str]],
+        upstream: str | None,
+        identity: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """汇总远端协议与 SSH 身份生效情况（不发起网络请求）。
+
+        参数：
+            repo: 仓库字典。
+            remotes: _read_remotes 的返回值。
+            upstream: 当前分支 upstream（如 origin/main）。
+            identity: 当前生效的 SSH 身份。
+        返回值：
+            {name, protocol, url, ssh_identity_effective, https_with_ssh_identity,
+             ssh_convertible, ssh_url, credential_warning}。
+        """
+        selected_name = upstream.split("/", 1)[0] if upstream else ""
+        selected = next(
+            (item for item in remotes if item["name"] == selected_name), None
+        )
+        if selected is None and remotes:
+            selected = remotes[0]
+        if selected is None:
+            return {
+                "name": None,
+                "protocol": "unknown",
+                "url": "",
+                "ssh_identity_effective": False,
+                "https_with_ssh_identity": bool(identity),
+                "ssh_convertible": False,
+                "ssh_url": None,
+                "credential_warning": None,
+            }
+
+        protocol = selected.get("protocol") or "unknown"
+        url = selected.get("push_url") or selected.get("fetch_url") or ""
+        conversion = https_to_ssh(url)
+        info: dict[str, Any] = {
+            "name": selected["name"],
+            "protocol": protocol,
+            "url": url,
+            "ssh_identity_effective": bool(identity) and protocol == "ssh",
+            "https_with_ssh_identity": bool(identity) and protocol == "https",
+            "ssh_convertible": bool(conversion.get("ok")),
+            "ssh_url": conversion.get("ssh_url") if conversion.get("ok") else None,
+            "credential_warning": None,
+        }
+        # 仅在审计中存在 403 历史时给出凭据提示，避免每次预检都误报
+        failure = self.database.last_push_failure(int(repo["id"]))
+        if protocol == "https" and failure:
+            history = f"{failure.get('output_summary') or ''}\n{failure.get('command') or ''}"
+            match = re.search(r"permission to\s+(.+?)\s+denied to\s+([^\s]+)", history, re.I)
+            if match or "returned error: 403" in history.lower():
+                owner = match.group(1).strip().rstrip(".") if match else ""
+                account = match.group(2).strip().rstrip(".,;:。") if match else ""
+                info["credential_warning"] = {
+                    "owner": owner,
+                    "account": account,
+                    "ts": failure.get("ts"),
+                    "message": (
+                        f"历史推送曾因凭据账号 {account} 对 {owner} 无写权限而失败，"
+                        "建议改用 SSH 地址或更换 HTTPS 凭据。"
+                        if match
+                        else "历史推送曾返回 403，建议检查当前 HTTPS 凭据权限。"
+                    ),
+                }
+        return info
 
     def collect_status_by_id(self, repo_id: int) -> dict[str, Any]:
         """按仓库 id 采集体检状态。
@@ -1206,7 +1592,7 @@ class GitManagerService:
         参数：
             repo: 仓库字典。
         返回值：
-            [{name, fetch_url, push_url}]；失败时返回空列表。
+            [{name, fetch_url, push_url, protocol}]；失败时返回空列表。
         """
         result = self.executor.run(
             repo["id"],
@@ -1223,7 +1609,8 @@ class GitManagerService:
                 continue
             name, url, kind = parts[0], parts[1], parts[-1]
             entry = items.setdefault(
-                name, {"name": name, "fetch_url": "", "push_url": ""}
+                name,
+                {"name": name, "fetch_url": "", "push_url": "", "protocol": "unknown"},
             )
             if kind == "(fetch)":
                 entry["fetch_url"] = url
@@ -1231,6 +1618,10 @@ class GitManagerService:
                 entry["push_url"] = url
             elif not entry["fetch_url"]:
                 entry["fetch_url"] = url
+        for entry in items.values():
+            entry["protocol"] = detect_remote_protocol(
+                entry.get("push_url") or entry.get("fetch_url") or ""
+            )
         return list(items.values())
 
     def _list_remotes(self, repo: dict[str, Any]) -> list[str]:
@@ -1420,9 +1811,11 @@ class GitManagerService:
         repo = self.get_repo(repo_id)
         self._ensure_repo_dir(repo)
         parsed = self._collect_dirty(repo)
+        diagnosis = self._diagnose_dirty(repo, parsed)
+        decorated = self._decorate_files(parsed, diagnosis)
         files: list[dict[str, Any]] = []
         for group in ("staged", "modified", "deleted", "untracked", "conflicts"):
-            for item in parsed[group]:
+            for item in decorated[group]:
                 files.append(
                     {
                         "path": item["path"],
@@ -1430,12 +1823,18 @@ class GitManagerService:
                         "group": group,
                         "old_path": item.get("old_path"),
                         "renamed": bool(item.get("renamed")),
+                        "muted": bool(item.get("muted")),
+                        "mute_id": item.get("mute_id"),
+                        "diagnosis": item.get("diagnosis"),
+                        "ignore_source": item.get("ignore_source"),
                     }
                 )
         return {
             "files": files,
             "conflicts": parsed["conflicts"],
-            "counts": parsed["counts"],
+            # 保留四类分组计数（兼容既有看板与测试），并补充归因/静音计数
+            "counts": {**diagnosis["counts"], **parsed["counts"]},
+            "mutes": diagnosis["mutes"],
         }
 
     def commit_repository(
@@ -1638,3 +2037,602 @@ class GitManagerService:
             only_failed=only_failed,
         )
         return {"total": total, "items": items}
+
+    # ------------------------------------------------------------------
+    # 忽略规则报告、写入 .gitignore、本地静音、取消跟踪
+    # ------------------------------------------------------------------
+
+    def _write_manual_audit(
+        self, repo: dict[str, Any], action: str, command: str, summary: str
+    ) -> None:
+        """写入不经过 git 子进程的动作审计（如追加 .gitignore、静音、凭据操作）。
+
+        参数：
+            repo: 仓库字典。
+            action: 动作类型（ignore_append / mute / untrack 等）。
+            command: 展示用命令或操作描述。
+            summary: 结果摘要。
+        返回值：
+            无。
+        """
+        self.database.insert_audit(
+            {
+                "ts": now_iso(),
+                "repo_id": repo.get("id"),
+                "repo_path": repo.get("path", ""),
+                "action": action,
+                "command": command,
+                "exit_code": 0,
+                "ok": True,
+                "duration_ms": 0,
+                "forced": False,
+                "output_summary": summary,
+                "identity_name": None,
+            }
+        )
+
+    def ignore_report(self, repo_id: int) -> dict[str, Any]:
+        """生成某个仓库的忽略归因报告（三类文件与静音规则）。
+
+        参数：
+            repo_id: 仓库主键。
+        返回值：
+            {repo, files, counts, mutes, gitignore}；files 每项含
+            tracked / ignored / ignore_source / diagnosis / muted。
+        """
+        repo = self.get_repo(repo_id)
+        self._ensure_repo_dir(repo)
+        parsed = self._collect_dirty(repo)
+        diagnosis = self._diagnose_dirty(repo, parsed)
+        gitignore_path = Path(repo["path"]) / ".gitignore"
+        return {
+            "repo": {"id": repo["id"], "name": repo["name"], "path": repo["path"]},
+            "files": diagnosis["files"],
+            "counts": diagnosis["counts"],
+            "mutes": diagnosis["mutes"],
+            "gitignore": {
+                "path": str(gitignore_path),
+                "exists": diagnosis["gitignore_exists"],
+            },
+        }
+
+    def _rule_for_path(self, repo_path: str, raw: str) -> str | None:
+        """为单个路径生成 .gitignore 规则建议。
+
+        参数：
+            repo_path: 仓库根目录。
+            raw: 用户/前端提交的路径。
+        返回值：
+            文件返回 "/相对路径"，目录返回 "相对路径/"；
+            路径非法（为空或越出仓库）时返回 None。
+        """
+        rel = _rel_to_repo(repo_path, raw).strip()
+        if not rel or rel.startswith("../") or rel == "..":
+            return None
+        is_dir = rel.endswith("/") or (Path(repo_path) / rel).is_dir()
+        rel = rel.strip("/")
+        if not rel:
+            return None
+        return f"{rel}/" if is_dir else f"/{rel}"
+
+    def _read_gitignore(self, target: Path) -> tuple[bytes, str, str]:
+        """读取目标 .gitignore 的原始字节与文本（保留 BOM 与换行风格）。
+
+        参数：
+            target: .gitignore 文件路径。
+        返回值：
+            (原始字节, 去掉 BOM 的文本, 换行风格 "\\r\\n" 或 "\\n")。
+            BOM 通过文本内容保留在原始字节中，追加时不破坏。
+        """
+        if not target.is_file():
+            return b"", "", "\n"
+        raw = target.read_bytes()
+        bom = raw.startswith(b"\xef\xbb\xbf")
+        body = raw[3:] if bom else raw
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            text = body.decode("utf-8", errors="replace")
+        newline = "\r\n" if "\r\n" in text else "\n"
+        return raw, text, newline
+
+    def preview_ignore(self, repo_id: int, paths: list[str]) -> dict[str, Any]:
+        """生成 .gitignore 追加预览（不写入任何文件）。
+
+        参数：
+            repo_id: 仓库主键。
+            paths: 待忽略的路径列表。
+        返回值：
+            {target, exists, newline, rules, skipped, append, original, preview}。
+            skipped 记录因等价规则已存在而不再追加的项。
+        """
+        repo = self.get_repo(repo_id)
+        self._ensure_repo_dir(repo)
+        target = Path(repo["path"]) / ".gitignore"
+        raw, text, newline = self._read_gitignore(target)
+        existing = {
+            line.strip().lstrip("/").rstrip("/")
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        rules: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw_path in paths[:500]:
+            rule = self._rule_for_path(repo["path"], raw_path)
+            if rule is None:
+                continue
+            key = rule.lstrip("/").rstrip("/").lower()
+            if key in existing or key in seen:
+                skipped.append(
+                    {
+                        "path": raw_path,
+                        "rule": rule,
+                        "reason": "等价规则已存在，不重复追加。",
+                    }
+                )
+                continue
+            seen.add(key)
+            rules.append({"path": raw_path, "rule": rule})
+
+        append_block = "".join(f"{item['rule']}{newline}" for item in rules)
+        original_display = text
+        if original_display and not original_display.endswith(("\n", "\r")):
+            original_display += newline
+        preview = original_display + append_block
+        return {
+            "target": str(target),
+            "exists": target.is_file(),
+            "newline": "crlf" if newline == "\r\n" else "lf",
+            "rules": rules,
+            "skipped": skipped,
+            "append": append_block,
+            "original": text[-8000:],
+            "original_truncated": len(text) > 8000,
+            "preview": preview[-9000:],
+            "preview_truncated": len(preview) > 9000,
+            "had_trailing_newline": bool(raw) and raw.endswith(b"\n"),
+        }
+
+    def append_ignore(self, repo_id: int, paths: list[str], note: str = "") -> dict[str, Any]:
+        """把选中的规则追加到仓库根 .gitignore，并立即刷新状态验证。
+
+        参数：
+            repo_id: 仓库主键。
+            paths: 待忽略的路径列表。
+            note: 可选备注（写入审计摘要）。
+        返回值：
+            {ok, target, appended, skipped, message, status}。
+        """
+        repo = self.get_repo(repo_id)
+        self._ensure_repo_dir(repo)
+        preview = self.preview_ignore(repo_id, paths)
+        rules = [item["rule"] for item in preview["rules"]]
+        if not rules:
+            return {
+                "ok": True,
+                "target": preview["target"],
+                "appended": [],
+                "skipped": preview["skipped"],
+                "message": "所有规则均已存在，未修改 .gitignore。",
+                "status": self.collect_status(repo),
+            }
+        target = Path(preview["target"])
+        raw, _text, newline = self._read_gitignore(target)
+        block = "".join(f"{rule}{newline}" for rule in rules).encode("utf-8")
+        if raw and not raw.endswith(b"\n"):
+            block = newline.encode("utf-8") + block
+        with target.open("ab") as handle:
+            handle.write(block)
+        self._write_manual_audit(
+            repo,
+            "ignore_append",
+            f"append .gitignore: {', '.join(rules)}",
+            f"追加 {len(rules)} 条规则" + (f"；备注：{note}" if note else ""),
+        )
+        return {
+            "ok": True,
+            "target": str(target),
+            "appended": rules,
+            "skipped": preview["skipped"],
+            "message": f"已向 .gitignore 追加 {len(rules)} 条规则。",
+            "status": self.collect_status(repo),
+        }
+
+    def add_mutes(
+        self, repo_id: int, patterns: list[str], note: str = ""
+    ) -> dict[str, Any]:
+        """把路径/规则写入本地静音表（只影响看板，不修改仓库）。
+
+        参数：
+            repo_id: 仓库主键。
+            patterns: 路径或通配规则列表。
+            note: 可选备注。
+        返回值：
+            {ok, added, skipped, mutes, message, status}。
+        """
+        repo = self.get_repo(repo_id)
+        self._ensure_repo_dir(repo)
+        added: list[str] = []
+        skipped: list[dict[str, str]] = []
+        existing = {
+            _rel_to_repo("", item["pattern"]).lstrip("/").lower()
+            for item in self.database.list_mutes(repo_id)
+        }
+        for raw_pattern in patterns[:200]:
+            pattern = _rel_to_repo(repo["path"], raw_pattern).strip().strip("/")
+            if not pattern:
+                continue
+            key = pattern.lower()
+            if key in existing:
+                skipped.append({"pattern": pattern, "reason": "该静音规则已存在。"})
+                continue
+            try:
+                self.database.insert_mute(repo_id, pattern, note)
+            except sqlite3.IntegrityError:
+                skipped.append({"pattern": pattern, "reason": "该静音规则已存在。"})
+                continue
+            existing.add(key)
+            added.append(pattern)
+        if added:
+            self._write_manual_audit(
+                repo,
+                "mute",
+                f"mute: {', '.join(added)}",
+                f"静音 {len(added)} 项" + (f"；备注：{note}" if note else ""),
+            )
+        return {
+            "ok": True,
+            "added": added,
+            "skipped": skipped,
+            "mutes": self.database.list_mutes(repo_id),
+            "message": f"已静音 {len(added)} 项（仅本地生效）。" if added else "没有新增静音项。",
+            "status": self.collect_status(repo),
+        }
+
+    def remove_mute(self, repo_id: int, mute_id: int) -> dict[str, Any]:
+        """删除一条本地静音规则（不影响磁盘文件与已跟踪状态）。
+
+        参数：
+            repo_id: 仓库主键。
+            mute_id: 静音规则主键。
+        返回值：
+            {ok, removed, mutes, status}。
+        异常：
+            ApiError: 规则不存在。
+        """
+        repo = self.get_repo(repo_id)
+        self._ensure_repo_dir(repo)
+        removed = self.database.delete_mute(repo_id, mute_id)
+        if removed is None:
+            raise ApiError("mute_not_found", "静音规则不存在或已被移除。", 404)
+        self._write_manual_audit(
+            repo, "mute_remove", f"unmute: {removed['pattern']}", "取消静音 1 项"
+        )
+        return {
+            "ok": True,
+            "removed": removed,
+            "mutes": self.database.list_mutes(repo_id),
+            "message": "已取消静音。",
+            "status": self.collect_status(repo),
+        }
+
+    def untrack_paths(
+        self, repo_id: int, paths: list[str], confirm: bool
+    ) -> dict[str, Any]:
+        """执行 `git rm --cached`：从版本库移除但保留磁盘文件。
+
+        参数：
+            repo_id: 仓库主键。
+            paths: 需要取消跟踪的路径。
+            confirm: 必须为 True（危险操作需显式确认）。
+        返回值：
+            {ok, removed, needs_commit, message, status}。
+        异常：
+            ApiError: 未确认、无有效路径或命令失败。
+        """
+        if not confirm:
+            raise ApiError(
+                "confirm_required",
+                "取消跟踪属于危险操作，请先确认“会从版本库移除但保留磁盘文件”。",
+                400,
+            )
+        repo = self.get_repo(repo_id)
+        self._ensure_repo_dir(repo)
+        tracked = self._read_tracked_paths(repo)
+        selected: list[str] = []
+        skipped: list[dict[str, str]] = []
+        for raw_path in paths[:200]:
+            rel = _rel_to_repo(repo["path"], raw_path).strip().strip("/")
+            if not rel:
+                continue
+            if rel.lower() not in tracked:
+                skipped.append({"path": rel, "reason": "该路径未被跟踪，无需取消跟踪。"})
+                continue
+            if rel not in selected:
+                selected.append(rel)
+        if not selected:
+            raise ApiError(
+                "nothing_to_untrack",
+                "没有可取消跟踪的文件（选中项均未被 git 跟踪）。",
+                400,
+                {"skipped": skipped},
+            )
+        result = self.executor.run(
+            repo["id"],
+            repo["path"],
+            "untrack",
+            [*QUOTEPATH_ARGS, "rm", "--cached", "--quiet", "--", *selected],
+            forced=True,
+        )
+        if not result.ok:
+            raise _error_from_result(
+                "untrack", result, extra={"paths": selected, "skipped": skipped}
+            )
+        return {
+            "ok": True,
+            "removed": selected,
+            "skipped": skipped,
+            "needs_commit": True,
+            "message": "已从版本库移除并保留磁盘文件；还需额外提交一次删除变更（未自动提交）。",
+            "status": self.collect_status(repo),
+        }
+
+    # ------------------------------------------------------------------
+    # 远端协议转换与 HTTPS 凭据
+    # ------------------------------------------------------------------
+
+    def preview_remote_ssh(self, repo_id: int, remote_name: str) -> dict[str, Any]:
+        """生成远端地址 HTTPS→SSH 转换预览（不修改配置）。
+
+        参数：
+            repo_id: 仓库主键。
+            remote_name: 远端名称（为空时使用当前分支远端或第一个）。
+        返回值：
+            {remote, fetch_url, push_url, ssh_fetch_url, ssh_push_url,
+             fetch_convertible, push_convertible, reason}。
+        """
+        repo = self.get_repo(repo_id)
+        self._ensure_repo_dir(repo)
+        remotes = self._read_remotes(repo)
+        selected = next(
+            (item for item in remotes if item["name"] == remote_name), None
+        )
+        if selected is None and remotes:
+            selected = remotes[0]
+        if selected is None:
+            raise ApiError("remote_missing", "该仓库未配置远端。", 404)
+        fetch = https_to_ssh(selected.get("fetch_url") or "")
+        push = https_to_ssh(selected.get("push_url") or selected.get("fetch_url") or "")
+        reasons = [
+            item.get("reason")
+            for item in (fetch, push)
+            if not item.get("ok")
+        ]
+        return {
+            "remote": selected["name"],
+            "fetch_url": selected.get("fetch_url") or "",
+            "push_url": selected.get("push_url") or "",
+            "ssh_fetch_url": fetch.get("ssh_url"),
+            "ssh_push_url": push.get("ssh_url"),
+            "fetch_convertible": bool(fetch.get("ok")),
+            "push_convertible": bool(push.get("ok")),
+            "reason": reasons[0] if reasons else None,
+        }
+
+    def convert_remote_ssh(
+        self, repo_id: int, remote_name: str, mode: str, confirm: bool
+    ) -> dict[str, Any]:
+        """把远端地址切换为 SSH（默认同时修改 fetch 与 push）。
+
+        参数：
+            repo_id: 仓库主键。
+            remote_name: 远端名称。
+            mode: both / push / fetch。
+            confirm: 必须为 True。
+        返回值：
+            {ok, remote, mode, fetch_url, push_url, message, status}。
+        """
+        if not confirm:
+            raise ApiError("confirm_required", "修改远端地址需要显式确认。", 400)
+        if mode not in ("both", "push", "fetch"):
+            raise ApiError("invalid_mode", "模式只能是 both / push / fetch。", 400)
+        repo = self.get_repo(repo_id)
+        self._ensure_repo_dir(repo)
+        preview = self.preview_remote_ssh(repo_id, remote_name)
+        name = preview["remote"]
+        need_fetch = mode in ("both", "fetch")
+        need_push = mode in ("both", "push")
+        if need_fetch and not preview["fetch_convertible"]:
+            raise ApiError(
+                "remote_not_convertible",
+                preview.get("reason") or "该远端地址不支持转换为 SSH。",
+                400,
+            )
+        if need_push and not preview["push_convertible"]:
+            raise ApiError(
+                "remote_not_convertible",
+                preview.get("reason") or "该远端地址不支持转换为 SSH。",
+                400,
+            )
+        commands: list[list[str]] = []
+        if need_fetch:
+            commands.append(["remote", "set-url", name, preview["ssh_fetch_url"]])
+        if need_push:
+            commands.append(
+                ["remote", "set-url", "--push", name, preview["ssh_push_url"]]
+            )
+        for command in commands:
+            result = self.executor.run(
+                repo["id"],
+                repo["path"],
+                "remote_set_url",
+                [*QUOTEPATH_ARGS, *command],
+            )
+            if not result.ok:
+                raise _error_from_result("remote_set_url", result)
+        return {
+            "ok": True,
+            "remote": name,
+            "mode": mode,
+            "fetch_url": preview["ssh_fetch_url"] if need_fetch else preview["fetch_url"],
+            "push_url": preview["ssh_push_url"] if need_push else preview["push_url"],
+            "message": "远端地址已切换为 SSH。",
+            "status": self.collect_status(repo),
+        }
+
+    def list_https_credentials(self) -> dict[str, Any]:
+        """读取 Windows 凭据管理器中的 git HTTPS 条目（不展示密码）。
+
+        参数：
+            无。
+        返回值：
+            {ok, items:[{target, host, url}], raw, message}。
+            仅在 Windows 可用；其他平台返回空列表并说明。
+        """
+        if os.name != "nt":
+            return {
+                "ok": False,
+                "items": [],
+                "raw": "",
+                "message": "当前系统不是 Windows，无法读取 cmdkey 凭据。",
+            }
+        try:
+            completed = subprocess.run(
+                ["cmdkey", "/list"],
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {
+                "ok": False,
+                "items": [],
+                "raw": "",
+                "message": f"读取凭据列表失败：{exc}",
+            }
+        text = completed.stdout.decode("utf-8", errors="replace")
+        if not text.strip():
+            text = completed.stdout.decode("mbcs", errors="replace")
+        items = parse_cmdkey_output(text)
+        return {
+            "ok": True,
+            "items": items,
+            "raw": text[-3000:],
+            "message": f"共找到 {len(items)} 条 git HTTPS 凭据。" if items else "未发现 git HTTPS 凭据。",
+        }
+
+    def delete_https_credential(self, target: str) -> dict[str, Any]:
+        """清除指定 host 的 git HTTPS 凭据（需显式确认后由调用方触发）。
+
+        参数：
+            target: cmdkey 目标，如 git:https://github.com。
+        返回值：
+            {ok, target, message}。
+        异常：
+            ApiError: 目标格式非法或删除失败。
+        """
+        text = (target or "").strip()
+        if not re.match(r"^git:(https?://[^\s]+)$", text, flags=re.IGNORECASE):
+            raise ApiError(
+                "invalid_credential_target",
+                "只允许清除形如 git:https://host 的 git HTTPS 凭据。",
+                400,
+            )
+        if os.name != "nt":
+            raise ApiError("unsupported_platform", "当前系统不支持 cmdkey。", 400)
+        try:
+            completed = subprocess.run(
+                ["cmdkey", f"/delete:{text}"],
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ApiError("credential_delete_failed", f"清除凭据失败：{exc}", 500)
+        output = (completed.stdout + completed.stderr).decode("utf-8", errors="replace")
+        if completed.returncode != 0:
+            raise ApiError(
+                "credential_delete_failed",
+                f"清除凭据失败（退出码 {completed.returncode}）：{output.strip()[-500:]}",
+                409,
+                {"command": f"cmdkey /delete:{text}", "exit_code": completed.returncode},
+            )
+        self._write_manual_audit(
+            {"id": None, "path": ""},
+            "credential_delete",
+            f"cmdkey /delete:{text}",
+            "已清除 git HTTPS 凭据",
+        )
+        return {
+            "ok": True,
+            "target": text,
+            "message": "已清除该 host 的凭据；下次推送会要求重新登录。",
+        }
+
+    def login_https_credential(self, confirm: bool) -> dict[str, Any]:
+        """在独立控制台窗口启动 Git Credential Manager 登录（可交互）。
+
+        参数：
+            confirm: 必须为 True（会打开外部窗口并可能要求输入凭据）。
+        返回值：
+            {ok, installed, launched, message, install_url}。
+            未安装 GCM 时明确返回 installed=False，不做假成功。
+        """
+        if not confirm:
+            raise ApiError(
+                "confirm_required", "打开交互式凭据登录需要显式确认。", 400
+            )
+        executable = shutil.which("git-credential-manager")
+        if executable is None:
+            return {
+                "ok": False,
+                "installed": False,
+                "launched": False,
+                "message": "未检测到 Git Credential Manager（git-credential-manager）。"
+                "请安装后再使用交互式登录。",
+                "install_url": "https://github.com/git-ecosystem/git-credential-manager/releases",
+            }
+        if os.name != "nt":
+            return {
+                "ok": False,
+                "installed": True,
+                "launched": False,
+                "message": "当前系统不支持独立控制台窗口登录，请在终端执行 git-credential-manager login。",
+                "install_url": "",
+            }
+        try:
+            subprocess.Popen(
+                [
+                    "cmd.exe",
+                    "/c",
+                    "start",
+                    "",
+                    "cmd.exe",
+                    "/k",
+                    "git-credential-manager login",
+                ],
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+                close_fds=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {
+                "ok": False,
+                "installed": True,
+                "launched": False,
+                "message": f"启动凭据登录窗口失败：{exc}",
+                "install_url": "",
+            }
+        self._write_manual_audit(
+            {"id": None, "path": ""},
+            "credential_login",
+            "git-credential-manager login",
+            "已在独立控制台窗口启动交互式凭据登录",
+        )
+        return {
+            "ok": True,
+            "installed": True,
+            "launched": True,
+            "message": "已在独立控制台窗口启动凭据登录，请按窗口提示完成。",
+            "install_url": "",
+        }

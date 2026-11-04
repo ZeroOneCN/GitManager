@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS repo_ssh_bindings (
     identity_id INTEGER NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ignored_paths (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER NOT NULL,
+    pattern TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ignored_repo ON ignored_paths(repo_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ignored_unique ON ignored_paths(repo_id, pattern);
 """
 
 
@@ -213,6 +224,67 @@ class Database:
                 return None
             conn.execute("DELETE FROM repositories WHERE id = ?", (repo_id,))
             conn.execute("DELETE FROM repo_ssh_bindings WHERE repo_id = ?", (repo_id,))
+            conn.execute("DELETE FROM ignored_paths WHERE repo_id = ?", (repo_id,))
+        return dict(row)
+
+    # ------------------------------------------------------------------
+    # 本地静音规则（ignored_paths）
+    # ------------------------------------------------------------------
+
+    def list_mutes(self, repo_id: int) -> list[dict[str, Any]]:
+        """列出某仓库的本地静音规则。
+
+        参数：
+            repo_id: 仓库主键。
+        返回值：
+            [{id, repo_id, pattern, note, created_at}]，按创建顺序排列。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, repo_id, pattern, note, created_at
+                FROM ignored_paths WHERE repo_id = ? ORDER BY id ASC
+                """,
+                (repo_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_mute(self, repo_id: int, pattern: str, note: str = "") -> int:
+        """写入一条本地静音规则（不修改仓库文件）。
+
+        参数：
+            repo_id: 仓库主键。
+            pattern: 路径或通配规则。
+            note: 可选备注。
+        返回值：
+            新记录 id。
+        异常：
+            sqlite3.IntegrityError: 同一仓库下规则重复时抛出。
+        """
+        with self._write_lock, self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO ignored_paths(repo_id, pattern, note, created_at) VALUES (?, ?, ?, ?)",
+                (repo_id, pattern, note, now_iso()),
+            )
+            return int(cursor.lastrowid)
+
+    def delete_mute(self, repo_id: int, mute_id: int) -> dict[str, Any] | None:
+        """删除一条本地静音规则。
+
+        参数：
+            repo_id: 仓库主键（防止跨仓库删除）。
+            mute_id: 规则主键。
+        返回值：
+            被删除的记录；不存在时返回 None。
+        """
+        with self._write_lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, repo_id, pattern, note, created_at FROM ignored_paths WHERE id = ? AND repo_id = ?",
+                (mute_id, repo_id),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute("DELETE FROM ignored_paths WHERE id = ?", (mute_id,))
         return dict(row)
 
     # ------------------------------------------------------------------
@@ -589,6 +661,26 @@ class Database:
                 [*params, limit, offset],
             ).fetchall()
         return total, [dict(row) for row in rows]
+
+    def last_push_failure(self, repo_id: int) -> dict[str, Any] | None:
+        """读取某仓库最近一次失败的推送审计记录。
+
+        参数：
+            repo_id: 仓库主键。
+        返回值：
+            {ts, action, command, output_summary}；没有失败记录时返回 None。
+            用于“仅在存在 403 历史时提示凭据问题”，不发起网络请求。
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ts, action, command, output_summary FROM audit_logs
+                WHERE repo_id = ? AND ok = 0 AND action IN ('push', 'push_set_upstream', 'push_force')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (repo_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def list_audit_actions(self) -> list[str]:
         """列出审计表中出现过的动作名（用于前端筛选下拉）。

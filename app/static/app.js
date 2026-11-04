@@ -54,6 +54,7 @@
     viewAudit: document.getElementById('view-audit'),
     tabs: Array.from(document.querySelectorAll('.tab')),
     summary: document.getElementById('summary-strip'),
+    summaryNote: document.getElementById('summary-note'),
     grid: document.getElementById('repo-grid'),
     empty: document.getElementById('empty-state'),
     emptyHint: document.getElementById('empty-hint'),
@@ -63,6 +64,7 @@
     btnRoot: document.getElementById('btn-root'),
     btnSsh: document.getElementById('btn-ssh'),
     btnScan: document.getElementById('btn-scan'),
+    btnCredentials: document.getElementById('btn-credentials'),
     identityStrip: document.getElementById('identity-strip'),
     toastStack: document.getElementById('toast-stack'),
     backdrop: document.getElementById('modal-backdrop'),
@@ -115,6 +117,15 @@
     commit: '提交',
     ssh_test: 'SSH 连接测试',
     scan: '扫描仓库',
+    ls_files: '读取索引',
+    check_ignore: '忽略规则探测',
+    ignore_append: '追加 .gitignore',
+    mute: '本地静音',
+    mute_remove: '取消静音',
+    untrack: '取消跟踪',
+    remote_set_url: '修改远端地址',
+    credential_delete: '清除 HTTPS 凭据',
+    credential_login: 'HTTPS 凭据登录',
   };
 
   // ------------------------------------------------------------------
@@ -247,7 +258,10 @@
       return { key: 'ahead', label: `待推送 ${upstream.ahead}` };
     }
     if ((dirty.total || 0) > 0) {
-      return { key: 'dirty', label: `工作区脏 ${dirty.total}` };
+      const pending = dirty.pending !== undefined ? dirty.pending : dirty.total;
+      if (pending > 0) return { key: 'dirty', label: `工作区脏 ${pending}` };
+      // 全部变更被本地静音：绝不能显示为“已同步/干净”
+      return { key: 'muted', label: `含静音 ${dirty.muted || 0}` };
     }
     if (!status.upstream) {
       return { key: 'noupstream', label: '未设置上游' };
@@ -369,9 +383,16 @@
     const ahead = statuses.filter((st) => st.upstream_status && st.upstream_status.ahead > 0).length;
     const conflicts = statuses.reduce((sum, st) => sum + ((st.dirty && st.dirty.conflicts) || 0), 0);
     const dirtyRepos = statuses.filter((st) => (st.dirty && st.dirty.total) > 0).length;
+    const pending = statuses.reduce((sum, st) => {
+      const dirty = st.dirty || {};
+      return sum + (dirty.pending !== undefined ? dirty.pending : (dirty.total || 0));
+    }, 0);
+    const muted = statuses.reduce((sum, st) => sum + ((st.dirty && st.dirty.muted) || 0), 0);
+    const trackedIgnored = statuses.reduce((sum, st) => sum + ((st.dirty && st.dirty.tracked_ignored) || 0), 0);
 
     if (!state.repos.length) {
       el.summary.hidden = true;
+      if (el.summaryNote) el.summaryNote.hidden = true;
       el.empty.hidden = false;
       el.grid.hidden = true;
       if (state.settings && state.settings.allowed_roots) {
@@ -390,7 +411,16 @@
       metric(ahead, '待推送仓库', ahead > 0 ? 'is-warn' : ''),
       metric(conflicts, '冲突文件', conflicts > 0 ? 'is-alert' : ''),
       metric(dirtyRepos, '脏工作区仓库', dirtyRepos > 0 ? 'is-warn' : ''),
+      metric(pending, '待处理变更数', pending > 0 ? 'is-warn' : ''),
+      metric(muted, '已静音数', muted > 0 ? 'is-muted' : ''),
+      metric(trackedIgnored, '已跟踪但被 ignore', trackedIgnored > 0 ? 'is-alert' : ''),
     ].join('');
+    if (el.summaryNote) {
+      el.summaryNote.hidden = muted === 0;
+      el.summaryNote.innerHTML = muted
+        ? `<span class="dot"></span>有 ${muted} 项变更被本地静音，仓库并未真正干净；展开卡片中的「已静音的变更」可恢复。`
+        : '';
+    }
   }
 
   function metric(value, label, cls) {
@@ -424,7 +454,19 @@
   }
 
   /**
-   * 渲染仓库远端地址（完整展示，不省略，附带复制按钮）。
+   * 返回远端协议的中文标签与样式类。
+   * 参数：protocol 协议标识（https/ssh/local/unknown）。
+   * 返回值：{label, cls}。
+   */
+  function protocolMeta(protocol) {
+    if (protocol === 'https') return { label: 'HTTPS', cls: 'is-https' };
+    if (protocol === 'ssh') return { label: 'SSH', cls: 'is-ssh' };
+    if (protocol === 'local') return { label: '本地', cls: 'is-local' };
+    return { label: '未知', cls: 'is-muted' };
+  }
+
+  /**
+   * 渲染仓库远端地址（完整展示，不省略，附带协议徽标与复制按钮）。
    * 参数：status 仓库状态对象（可能为 null）。
    * 返回值：HTML 字符串；无远端时为空串。
    */
@@ -433,24 +475,54 @@
     return status.remotes.map((remote) => {
       const url = remote.push_url || remote.fetch_url || '';
       if (!url) return '';
+      const meta = protocolMeta(remote.protocol);
       return `<div class="remote-line">
         <span class="label">${escapeHtml(remote.name)}</span>
+        <span class="protocol-badge ${meta.cls}">${meta.label}</span>
         <code class="full-text">${escapeHtml(url)}</code>
         <button class="btn-link" data-copy="${escapeHtml(url)}" data-copy-label="远端地址">复制</button>
       </div>`;
     }).join('');
   }
 
+  /**
+   * 渲染远端的协议/身份提示（仅在有意义时显示，避免误导）。
+   * 参数：status 仓库状态对象。
+   * 返回值：HTML 字符串。
+   */
+  function remoteHintHtml(status) {
+    const info = status && status.remote_info;
+    if (!info) return '';
+    const parts = [];
+    if (info.https_with_ssh_identity) {
+      parts.push(`<div class="inline-hint is-warn">
+        <span>SSH 身份对该仓库不生效（当前为 HTTPS 远端）。</span>
+        ${info.ssh_convertible ? '<button class="btn-link" data-act="remote">改用 SSH 地址</button>' : ''}
+      </div>`);
+    }
+    if (info.credential_warning) {
+      parts.push(`<div class="inline-hint is-alert">
+        <span>${escapeHtml(info.credential_warning.message)}</span>
+        <button class="btn-link" data-act="remote">处理</button>
+      </div>`);
+    }
+    return parts.join('');
+  }
+
   function cardHtml(repo, status) {
     const health = healthOf(status);
+    const protocol = status && status.remote_info ? status.remote_info.protocol : 'unknown';
+    const protocolInfo = protocolMeta(protocol);
     const header = `<div class="card-head">
       <div class="repo-name" title="${escapeHtml(repo.name)}">${escapeHtml(repo.name)}</div>
       <div class="repo-pills">${pillBranch(status)}
+        ${status && protocol !== 'unknown' ? `<span class="pill pill-protocol ${protocolInfo.cls}">${protocolInfo.label}</span>` : ''}
         <span class="pill is-${health.key}"><span class="dot"></span>${escapeHtml(health.label)}</span>
       </div>
     </div>
     <div class="repo-path" title="${escapeHtml(repo.path)}">${escapeHtml(repo.path)}</div>
-    ${remoteHtml(status)}`;
+    ${remoteHtml(status)}
+    ${status ? remoteHintHtml(status) : ''}`;
 
     if (!status) {
       return `<article class="repo-card" data-id="${repo.id}" data-health="unknown">
@@ -484,11 +556,14 @@
     const upstream = status.upstream_status;
     const ahead = upstream ? upstream.ahead : null;
     const behind = upstream ? upstream.behind : null;
+    const ignoreTotal = status.ignore && status.ignore.counts && status.ignore.counts.total
+      ? status.ignore.counts.total
+      : dirty.total;
 
     const stats = `<div class="stat-row">
       ${statCell(ahead === null ? '—' : ahead, '待推送', ahead === null ? 'is-muted' : '', !status.upstream ? '未设置上游' : '')}
       ${statCell(behind === null ? '—' : behind, '待拉取', behind === null ? 'is-muted' : '')}
-      ${statCell(dirty.total, '工作区改动', dirty.total ? 'is-warn' : '')}
+      ${statCell(dirty.pending !== undefined ? dirty.pending : dirty.total, '待处理', (dirty.pending !== undefined ? dirty.pending : dirty.total) ? 'is-warn' : '')}
       ${statCell(dirty.conflicts, '冲突文件', dirty.conflicts ? 'is-alert' : '')}
     </div>`;
 
@@ -508,6 +583,8 @@
           <span class="foot-ssh" title="当前生效的推送身份">· SSH ${escapeHtml(status.ssh_identity ? status.ssh_identity.name : '系统默认')}</span></div>
         <div class="card-actions">
           <button class="btn btn-sub btn-sm" data-act="commit" ${dirty.total ? '' : 'disabled'} title="${dirty.total ? '勾选文件并提交' : '工作区干净，无需提交'}">提交</button>
+          <button class="btn btn-ghost btn-sm" data-act="ignore" title="查看忽略归因并处理待处理文件">忽略规则（${ignoreTotal}）</button>
+          <button class="btn btn-ghost btn-sm" data-act="remote" title="查看远端协议与 HTTPS/SSH 切换">远端</button>
           <button class="btn btn-ghost btn-sm" data-act="ssh" title="为该仓库绑定 SSH 推送身份">身份</button>
           <button class="btn btn-ghost btn-sm" data-act="pull" title="git pull --ff-only">拉取</button>
           <button class="btn btn-ghost btn-sm" data-act="push" title="推送当前分支到上游">推送</button>
@@ -534,6 +611,8 @@
       dirty.deleted ? `<span class="chip is-deleted"><span class="dot"></span>已删除 ${dirty.deleted}</span>` : '',
       dirty.untracked ? `<span class="chip is-untracked"><span class="dot"></span>未跟踪 ${dirty.untracked}</span>` : '',
       dirty.conflicts ? `<span class="chip is-conflict"><span class="dot"></span>冲突 ${dirty.conflicts}</span>` : '',
+      dirty.muted ? `<span class="chip is-muted"><span class="dot"></span>已静音 ${dirty.muted}</span>` : '',
+      dirty.tracked_ignored ? `<span class="chip is-alert"><span class="dot"></span>已跟踪但被 ignore ${dirty.tracked_ignored}</span>` : '',
     ].join('');
 
     const groups = [
@@ -542,21 +621,42 @@
       ['已删除（未暂存）', status.files.deleted, 'code-deleted'],
       ['未跟踪', status.files.untracked, ''],
       ['冲突', status.files.conflicts, 'code-conflict'],
-    ].filter(([, items]) => items && items.length)
-      .map(([title, items, cls]) => `<div class="file-group">
+    ].map(([title, items, cls]) => {
+      const visible = (items || []).filter((item) => !item.muted);
+      if (!visible.length) return '';
+      return `<div class="file-group">
         <div class="file-group-title">${escapeHtml(title)}</div>
-        ${items.map((item) => `<div class="file-row">
+        ${visible.map((item) => `<div class="file-row">
           <span class="file-code ${cls}">${escapeHtml(item.code.replace(/\s+/g, '␣'))}</span>
           <span class="file-path" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span>
+          ${item.diagnosis === 'tracked_ignored' ? '<span class="file-flag is-alert">已跟踪·忽略无效</span>' : ''}
         </div>`).join('')}
-      </div>`).join('');
+      </div>`;
+    }).join('');
+
+    const allFiles = ['staged', 'modified', 'deleted', 'untracked', 'conflicts']
+      .flatMap((group) => (status.files[group] || []));
+    const mutedFiles = allFiles.filter((item) => item.muted);
+    const mutedBlock = mutedFiles.length ? `<details class="muted-details">
+      <summary>已静音的变更（${mutedFiles.length}）</summary>
+      <div class="file-scroll">
+        ${mutedFiles.map((item) => `<div class="file-row">
+          <span class="file-code">${escapeHtml((item.code || '').replace(/\s+/g, '␣'))}</span>
+          <span class="file-path" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span>
+          <span class="file-flag">静音</span>
+          <button class="btn-link" data-unmute="${item.mute_id}" data-repo="${status.repo.id}">取消静音</button>
+        </div>`).join('')}
+      </div>
+      <div class="hint">静音仅影响看板判定，仓库文件与 git 状态未改变。</div>
+    </details>` : '';
 
     return `<div class="dirty-block">
       <div class="dirty-chips">${chips}</div>
       <details class="dirty-details">
         <summary>查看文件明细（${dirty.total}）</summary>
-        <div class="file-scroll">${groups || '<div class="commit-empty">暂无明细</div>'}</div>
+        <div class="file-scroll">${groups || '<div class="commit-empty">未静音的改动为空</div>'}</div>
       </details>
+      ${mutedBlock}
     </div>`;
   }
 
@@ -589,9 +689,31 @@
     if (action === 'pull') return openPullModal(id);
     if (action === 'push') return openPushModal(id);
     if (action === 'commit') return openCommitModal(id);
+    if (action === 'ignore') return openIgnoreModal(id);
+    if (action === 'remote') return openRemoteModal(id);
     if (action === 'ssh') return openRepoSshModal(id);
     if (action === 'remove') return removeRepo(id);
     return undefined;
+  }
+
+  /**
+   * 取消静音（仅本地规则，不改仓库文件）。
+   * 参数：repoId 仓库主键；muteId 静音规则主键。
+   * 返回值：Promise<void>。
+   */
+  async function unmutePath(repoId, muteId) {
+    if (!Number.isFinite(repoId) || !Number.isFinite(muteId)) return;
+    try {
+      const result = await api(`/api/repos/${repoId}/mutes/${muteId}`, { method: 'DELETE' });
+      if (result.status) {
+        state.statuses.set(repoId, result.status);
+        renderSummary();
+        renderRepos();
+      }
+      toast(result.message || '已取消静音。', 'success');
+    } catch (err) {
+      toast(err.message, 'error', 6000);
+    }
   }
 
   async function removeRepo(id) {
@@ -768,6 +890,7 @@
     const status = statusById(id);
     if (!repo) return;
     const dirty = (status && status.dirty && status.dirty.total) || 0;
+    const mutedCount = (status && status.dirty && status.dirty.muted) || 0;
     const defaultStash = Boolean(state.settings && state.settings.pull_auto_stash_default);
     const upstreamText = status && status.upstream ? status.upstream : '未设置';
 
@@ -779,12 +902,13 @@
         </div>
         <div class="kv"><span>当前分支</span><strong>${escapeHtml(status && status.branch ? status.branch : '未知')}</strong></div>
         <div class="kv"><span>上游分支</span><strong>${escapeHtml(upstreamText)}</strong></div>
-        <div class="kv"><span>工作区</span><strong>${dirty ? `${dirty} 个未提交改动` : '干净'}</strong></div>
+        <div class="kv"><span>工作区</span><strong>${dirty ? `${dirty} 个未提交改动${mutedCount ? `（含 ${mutedCount} 项静音）` : ''}` : '干净'}</strong></div>
         <label class="check" style="margin-top:14px">
           <input type="checkbox" id="pull-stash" ${dirty && defaultStash ? 'checked' : ''}>
           <span>pull 前自动 stash（成功后自动 pop；失败则保留，不会静默丢弃）</span>
         </label>
         <div class="hint">本次操作固定执行 <code>git pull --ff-only</code>，不会产生合并提交。若未设置 upstream、本地与远端分叉或工作区有改动，将中止并返回原因。</div>
+        <div id="pull-diagnosis"></div>
         <div class="error-box" id="modal-error" hidden></div>
       `,
       foot: `<button class="btn btn-ghost" id="pull-cancel">取消</button>
@@ -817,6 +941,7 @@
         let message = err.message;
         if (err.payload && err.payload.output) message += `\n${err.payload.output}`;
         showModalError(message);
+        renderDiagnosis('pull-diagnosis', id, err);
         if (err.payload && err.payload.dirty && stashBox) {
           stashBox.checked = false;
         }
@@ -847,12 +972,15 @@
     }
 
     const remoteListHtml = remoteDetails.length
-      ? `<div class="remote-list">${remoteDetails.map((remote) => `
-          <div class="remote-line">
+      ? `<div class="remote-list">${remoteDetails.map((remote) => {
+          const meta = protocolMeta(remote.protocol);
+          return `<div class="remote-line">
             <span class="label">${escapeHtml(remote.name)}</span>
+            <span class="protocol-badge ${meta.cls}">${meta.label}</span>
             <code class="full-text">${escapeHtml(remote.push_url || remote.fetch_url)}</code>
             <button class="btn-link" data-copy="${escapeHtml(remote.push_url || remote.fetch_url)}" data-copy-label="远端地址">复制</button>
-          </div>`).join('')}</div>`
+          </div>`;
+        }).join('')}</div>`
       : '';
 
     const upstream = status && status.upstream ? status.upstream : null;
@@ -897,6 +1025,7 @@
         ${upstreamSection}
         ${remoteListHtml}
         ${forceSection}
+        <div id="push-diagnosis"></div>
         <div class="error-box" id="modal-error" hidden></div>
       `,
       foot: `<button class="btn btn-ghost" id="push-cancel">取消</button>
@@ -928,6 +1057,7 @@
         let message = err.message;
         if (err.payload && err.payload.output) message += `\n${err.payload.output}`;
         showModalError(message);
+        renderDiagnosis('push-diagnosis', id, err);
         refreshOne(id, true);
       } finally {
         busyButton(confirmBtn, false);
@@ -987,9 +1117,11 @@
     // 同一文件可能同时出现在 staged 与 modified，按路径去重并合并分组
     const merged = new Map();
     for (const file of changes.files || []) {
-      const entry = merged.get(file.path) || { path: file.path, code: file.code, groups: new Set() };
+      const entry = merged.get(file.path) || { path: file.path, code: file.code, groups: new Set(), muted: false, diagnosis: null };
       entry.groups.add(file.group);
       if (file.group === 'conflicts') entry.code = file.code;
+      if (file.muted) entry.muted = true;
+      if (file.diagnosis) entry.diagnosis = file.diagnosis;
       merged.set(file.path, entry);
     }
 
@@ -1002,6 +1134,8 @@
           <input type="checkbox" class="commit-check" value="${escapeHtml(entry.path)}" ${group === 'conflicts' ? 'disabled' : ''}>
           <span class="code ${group === 'conflicts' ? 'is-conflict' : ''}">${escapeHtml(entry.code.replace(/\s+/g, '␣'))}</span>
           <span class="path" title="${escapeHtml(entry.path)}">${escapeHtml(entry.path)}</span>
+          ${entry.muted ? '<span class="file-flag">静音</span>' : ''}
+          ${entry.diagnosis === 'tracked_ignored' ? '<span class="file-flag is-alert">已跟踪·忽略无效</span>' : ''}
         </label>`).join('')}
       </div>`;
     }).join('');
@@ -2256,6 +2390,572 @@
   // 事件绑定与初始化
   // ------------------------------------------------------------------
 
+  // ------------------------------------------------------------------
+  // 忽略规则面板 / 静音 / 取消跟踪
+  // ------------------------------------------------------------------
+
+  const DIAGNOSIS_TEXT = {
+    untracked_ignorable: '未被任何规则匹配，可加入 .gitignore',
+    rule_matched: '命中忽略规则，但仍出现在看板',
+    tracked_ignored: '已被跟踪，忽略规则不生效',
+    dirty_tracked: '已跟踪的改动，正常提交即可',
+  };
+
+  /**
+   * 渲染忽略面板中的单个文件行（含规则来源原文与勾选框）。
+   * 参数：item 归因文件对象。
+   * 返回值：HTML 字符串。
+   */
+  function ignoreRowHtml(item) {
+    const checked = item.diagnosis === 'untracked_ignorable' || item.diagnosis === 'tracked_ignored';
+    const source = item.ignore_source
+      ? `<code class="rule-source full-text" title="规则来源">${escapeHtml(item.ignore_source)}</code>
+         <button class="btn-link" data-copy="${escapeHtml(item.ignore_source)}" data-copy-label="规则来源">复制</button>`
+      : '';
+    return `<div class="ignore-row">
+      <input type="checkbox" class="ignore-check" data-path="${escapeHtml(item.path)}"
+        data-diagnosis="${escapeHtml(item.diagnosis)}" data-tracked="${item.tracked ? '1' : '0'}" ${checked ? 'checked' : ''}>
+      <div class="ignore-main">
+        <div class="ignore-path full-text">${escapeHtml(item.path)}</div>
+        <div class="ignore-meta">
+          <span class="diag-badge is-${escapeHtml(item.diagnosis)}">${escapeHtml(DIAGNOSIS_TEXT[item.diagnosis] || item.diagnosis)}</span>
+          ${source}
+        </div>
+      </div>
+    </div>`;
+  }
+
+  /**
+   * 打开忽略规则面板，按成因分组列出待处理文件与可执行动作。
+   * 参数：id 仓库主键。
+   * 返回值：Promise<void>。
+   */
+  async function openIgnoreModal(id) {
+    const repo = repoById(id);
+    if (!repo) return;
+    let report;
+    try {
+      report = await api(`/api/repos/${id}/ignore`);
+    } catch (err) {
+      toast(`读取忽略归因失败：${err.message}`, 'error', 6000);
+      return;
+    }
+    const files = report.files || [];
+    const counts = report.counts || {};
+    const mutedRows = files.filter((item) => item.muted);
+    const sections = [
+      {
+        diagnosis: 'untracked_ignorable',
+        title: '可忽略（未被任何规则匹配）',
+        hint: '可写入 .gitignore，或仅本地静音。',
+        items: files.filter((item) => item.diagnosis === 'untracked_ignorable'),
+      },
+      {
+        diagnosis: 'rule_matched',
+        title: '命中规则但仍出现在看板',
+        hint: '规则来源原样展示，便于排查反向规则或嵌套规则。',
+        items: files.filter((item) => item.diagnosis === 'rule_matched'),
+      },
+      {
+        diagnosis: 'tracked_ignored',
+        title: '已跟踪但命中 ignore 规则',
+        hint: '忽略规则对已跟踪文件不生效；可取消跟踪（保留磁盘文件），或仅本地静音。',
+        items: files.filter((item) => item.diagnosis === 'tracked_ignored'),
+      },
+      {
+        diagnosis: 'dirty_tracked',
+        title: '已跟踪的改动',
+        hint: '正常提交即可；也可仅本地静音（不会改变仓库状态）。',
+        items: files.filter((item) => item.diagnosis === 'dirty_tracked'),
+      },
+    ];
+    const sectionHtml = sections.map((section) => {
+      if (!section.items.length) return '';
+      return `<div class="ignore-section">
+        <div class="ignore-section-title">${escapeHtml(section.title)}<span class="count">${section.items.length}</span></div>
+        <div class="hint">${escapeHtml(section.hint)}</div>
+        ${section.items.map((item) => ignoreRowHtml(item)).join('')}
+      </div>`;
+    }).join('');
+    const mutesHtml = (report.mutes || []).length ? `<div class="ignore-section">
+      <div class="ignore-section-title">当前静音规则<span class="count">${report.mutes.length}</span></div>
+      ${report.mutes.map((mute) => `<div class="ignore-row">
+        <div class="ignore-main">
+          <div class="ignore-path full-text">${escapeHtml(mute.pattern)}</div>
+          <div class="ignore-meta"><span class="diag-badge is-muted">静音</span>
+            ${mute.note ? `<span class="muted-note">${escapeHtml(mute.note)}</span>` : ''}
+            <button class="btn-link" data-unmute="${mute.id}" data-repo="${id}">取消静音</button>
+          </div>
+        </div>
+      </div>`).join('')}
+    </div>` : '';
+    const mutedHtml = mutedRows.length ? `<div class="ignore-section">
+      <div class="ignore-section-title">已静音的变更<span class="count">${mutedRows.length}</span></div>
+      ${mutedRows.map((item) => `<div class="ignore-row">
+        <div class="ignore-main">
+          <div class="ignore-path full-text">${escapeHtml(item.path)}</div>
+          <div class="ignore-meta"><span class="diag-badge is-muted">静音</span>
+            <button class="btn-link" data-unmute="${item.mute_id}" data-repo="${id}">取消静音</button>
+          </div>
+        </div>
+      </div>`).join('')}
+    </div>` : '';
+
+    openModal({
+      title: `忽略规则 · ${repo.name}`,
+      wide: true,
+      body: `
+        <div class="repo-reference">
+          <div><div class="name">${escapeHtml(repo.name)}</div><div class="path">${escapeHtml(repo.path)}</div></div>
+        </div>
+        <div class="ignore-summary">
+          <span class="chip is-warn"><span class="dot"></span>待处理 ${counts.pending || 0}</span>
+          <span class="chip is-muted"><span class="dot"></span>已静音 ${counts.muted || 0}</span>
+          <span class="chip is-alert"><span class="dot"></span>已跟踪但被 ignore ${counts.tracked_ignored || 0}</span>
+          <span class="chip"><span class="dot"></span>规则命中 ${counts.rule_matched || 0}</span>
+        </div>
+        <div class="hint">.gitignore：${escapeHtml(report.gitignore.path)}（${report.gitignore.exists ? '已存在' : '不存在，将在确认后创建'}）</div>
+        ${sectionHtml || '<div class="commit-empty">当前没有待处理文件。</div>'}
+        ${mutesHtml}
+        ${mutedHtml}
+        <div class="error-box" id="modal-error" hidden></div>
+      `,
+      foot: `<button class="btn btn-ghost" id="ignore-close">关闭</button>
+        <button class="btn btn-ghost" id="ignore-mute" ${files.some((item) => !item.muted) ? '' : 'disabled'}>仅本地静音（选中）</button>
+        <button class="btn btn-ghost" id="ignore-untrack" ${(counts.tracked_ignored || 0) ? '' : 'disabled'}>取消跟踪（选中）</button>
+        <button class="btn btn-primary" id="ignore-append" ${files.some((item) => item.diagnosis === 'untracked_ignorable' && !item.muted) ? '' : 'disabled'}>写入 .gitignore（选中）</button>`,
+    });
+
+    document.getElementById('ignore-close').addEventListener('click', closeModal);
+    el.modalBody.querySelectorAll('[data-unmute]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        await unmutePath(id, Number(button.dataset.unmute));
+        openIgnoreModal(id);
+      });
+    });
+    document.getElementById('ignore-append').addEventListener('click', () => {
+      const selected = collectIgnoreSelection();
+      const paths = selected.filter((item) => item.diagnosis === 'untracked_ignorable').map((item) => item.path);
+      if (!paths.length) {
+        toast('请先勾选“可忽略（未被任何规则匹配）”的文件。', 'warn', 5000);
+        return;
+      }
+      showIgnorePreview(id, paths);
+    });
+    document.getElementById('ignore-mute').addEventListener('click', async () => {
+      const selected = collectIgnoreSelection();
+      if (!selected.length) {
+        toast('请先勾选需要静音的文件。', 'warn', 5000);
+        return;
+      }
+      try {
+        const result = await api(`/api/repos/${id}/mutes`, {
+          method: 'POST',
+          body: { patterns: selected.map((item) => item.path) },
+        });
+        await afterRepoAction(id, result, result.message || '已静音（仅本地生效）。');
+      } catch (err) {
+        showModalError(err.message);
+      }
+    });
+    const untrackBtn = document.getElementById('ignore-untrack');
+    untrackBtn.addEventListener('click', async () => {
+      const selected = collectIgnoreSelection();
+      const paths = selected.filter((item) => item.diagnosis === 'tracked_ignored').map((item) => item.path);
+      if (!paths.length) {
+        toast('请先在“已跟踪但命中 ignore 规则”中勾选文件。', 'warn', 5000);
+        return;
+      }
+      const ok = await confirmDialog({
+        title: '取消跟踪（危险操作）',
+        message: `将从版本库移除以下 ${paths.length} 个路径，但保留磁盘文件：\n${paths.join('\n')}\n\n执行后还需要额外提交一次删除变更（不会自动提交）。`,
+        confirmLabel: '取消跟踪',
+        danger: true,
+      });
+      if (!ok) return;
+      try {
+        const result = await api(`/api/repos/${id}/untrack`, {
+          method: 'POST',
+          body: { paths, confirm: true },
+        });
+        await afterRepoAction(id, result, result.message || '已取消跟踪。');
+      } catch (err) {
+        showModalError(err.message);
+      }
+    });
+  }
+
+  /**
+   * 读取忽略面板中已勾选的项（路径、归因、是否已跟踪）。
+   * 参数：无。
+   * 返回值：[{path, diagnosis, tracked}]。
+   */
+  function collectIgnoreSelection() {
+    return Array.from(el.modalBody.querySelectorAll('.ignore-check:checked')).map((box) => ({
+      path: box.dataset.path,
+      diagnosis: box.dataset.diagnosis,
+      tracked: box.dataset.tracked === '1',
+    }));
+  }
+
+  /**
+   * 在忽略面板内展示 .gitignore 追加预览，确认后才写入。
+   * 参数：id 仓库主键；paths 待忽略路径。
+   * 返回值：Promise<void>。
+   */
+  async function showIgnorePreview(id, paths) {
+    let preview;
+    try {
+      preview = await api(`/api/repos/${id}/ignore/preview`, {
+        method: 'POST',
+        body: { paths },
+      });
+    } catch (err) {
+      showModalError(`生成预览失败：${err.message}`);
+      return;
+    }
+    const rules = preview.rules || [];
+    const skipped = preview.skipped || [];
+    if (!rules.length) {
+      setModalBody(`<div class="ignore-section">
+        <div class="ignore-section-title">无需追加</div>
+        <div class="hint">${escapeHtml(preview.target)} 中已存在等价规则。下面是被跳过的项：</div>
+        ${skipped.map((item) => `<div class="ignore-row"><div class="ignore-main">
+          <div class="ignore-path full-text">${escapeHtml(item.path)}</div>
+          <div class="ignore-meta"><code class="rule-source">${escapeHtml(item.rule)}</code>${escapeHtml(item.reason)}</div>
+        </div></div>`).join('')}
+      </div>`);
+      setModalFoot('<button class="btn btn-ghost" id="ignore-back">返回</button>');
+      document.getElementById('ignore-back').addEventListener('click', () => openIgnoreModal(id));
+      return;
+    }
+    setModalBody(`
+      <div class="kv"><span>目标文件</span><strong class="full-text">${escapeHtml(preview.target)}</span></div>
+      <div class="kv"><span>文件状态</span><strong>${preview.exists ? '已存在，将在末尾追加' : '不存在，将新建'}</strong></div>
+      <div class="kv"><span>换行风格</span><strong>${preview.newline === 'crlf' ? 'CRLF' : 'LF'}</strong></div>
+      <div class="section-label" style="margin-top:12px">将要追加的规则</div>
+      <pre class="preview-block full-text">${escapeHtml(preview.append)}</pre>
+      ${skipped.length ? `<div class="section-label" style="margin-top:12px">已存在、将跳过</div>
+        <pre class="preview-block full-text">${escapeHtml(skipped.map((item) => `${item.rule}  ← ${item.path}`).join('\n'))}</pre>` : ''}
+      <details class="dirty-details" style="margin-top:12px">
+        <summary>查看追加后的完整预览</summary>
+        <pre class="preview-block full-text">${escapeHtml(preview.preview)}</pre>
+      </details>
+      <div class="hint">只会追加到仓库根 .gitignore，不覆盖原有内容；已存在的等价规则不会重复追加。</div>
+      <div class="error-box" id="modal-error" hidden></div>
+    `);
+    setModalFoot(`<button class="btn btn-ghost" id="ignore-back">返回</button>
+      <button class="btn btn-primary" id="ignore-confirm">追加并刷新</button>`);
+    document.getElementById('ignore-back').addEventListener('click', () => openIgnoreModal(id));
+    const confirmBtn = document.getElementById('ignore-confirm');
+    confirmBtn.addEventListener('click', async () => {
+      busyButton(confirmBtn, true);
+      try {
+        const result = await api(`/api/repos/${id}/ignore`, {
+          method: 'POST',
+          body: { paths },
+        });
+        let message = result.message || '已追加规则。';
+        if (!preview.exists) message += ' 新建的 .gitignore 会以未跟踪状态出现，可一并提交。';
+        await afterRepoAction(id, result, message, 6000);
+      } catch (err) {
+        showModalError(err.message);
+        busyButton(confirmBtn, false);
+      }
+    });
+  }
+
+  /**
+   * 动作成功后的统一收尾：更新状态、关闭弹窗、刷新并提示。
+   * 参数：id 仓库主键；result 接口结果；message 提示；duration 显示时长。
+   * 返回值：Promise<void>。
+   */
+  async function afterRepoAction(id, result, message, duration = 4000) {
+    if (result.status) state.statuses.set(id, result.status);
+    renderSummary();
+    renderRepos();
+    closeModal();
+    toast(message, 'success', duration);
+    await refreshOne(id, true);
+  }
+
+  // ------------------------------------------------------------------
+  // 远端协议与 HTTPS 凭据
+  // ------------------------------------------------------------------
+
+  /**
+   * 打开远端面板：展示协议、完整地址、SSH 身份提示与切换入口。
+   * 参数：id 仓库主键。
+   * 返回值：Promise<void>。
+   */
+  async function openRemoteModal(id) {
+    const repo = repoById(id);
+    if (!repo) return;
+    let data;
+    try {
+      data = await api(`/api/repos/${id}/remotes`);
+    } catch (err) {
+      toast(`读取远端失败：${err.message}`, 'error', 6000);
+      return;
+    }
+    const info = (statusById(id) || {}).remote_info || {};
+    const rows = (data.remotes || []).map((remote) => {
+      const meta = protocolMeta(remote.protocol);
+      return `<div class="remote-line">
+        <span class="label">${escapeHtml(remote.name)}</span>
+        <span class="protocol-badge ${meta.cls}">${meta.label}</span>
+        <code class="full-text">${escapeHtml(remote.push_url || remote.fetch_url)}</code>
+        <button class="btn-link" data-copy="${escapeHtml(remote.push_url || remote.fetch_url)}" data-copy-label="远端地址">复制</button>
+      </div>`;
+    }).join('') || '<div class="commit-empty">该仓库未配置远端。</div>';
+    const hints = [];
+    if (info.https_with_ssh_identity) {
+      hints.push('<div class="inline-hint is-warn"><span>SSH 身份对该仓库不生效（当前为 HTTPS 远端）。</span></div>');
+    }
+    if (info.credential_warning) {
+      hints.push(`<div class="inline-hint is-alert"><span>${escapeHtml(info.credential_warning.message)}</span></div>`);
+    }
+    openModal({
+      title: `远端 · ${repo.name}`,
+      wide: true,
+      body: `
+        <div class="repo-reference">
+          <div><div class="name">${escapeHtml(repo.name)}</div><div class="path">${escapeHtml(repo.path)}</div></div>
+        </div>
+        <div class="section-label">远端列表</div>
+        ${rows}
+        ${hints.join('')}
+        <div class="hint">协议徽标来自 push URL；SSH 地址形如 git@github.com:owner/repo.git。</div>
+        <div class="error-box" id="modal-error" hidden></div>
+      `,
+      foot: `<button class="btn btn-ghost" id="remote-credentials">管理 HTTPS 凭据</button>
+        ${info.ssh_convertible ? '<button class="btn btn-primary" id="remote-convert">改用 SSH 地址</button>' : ''}
+        <button class="btn btn-ghost" id="remote-close">关闭</button>`,
+    });
+    document.getElementById('remote-close').addEventListener('click', closeModal);
+    document.getElementById('remote-credentials').addEventListener('click', openCredentialsModal);
+    const convertBtn = document.getElementById('remote-convert');
+    if (convertBtn) {
+      convertBtn.addEventListener('click', () => showRemoteSshPreview(id, info.name || ''));
+    }
+  }
+
+  /**
+   * 展示 HTTPS→SSH 地址转换预览并允许选择 only-push / only-fetch。
+   * 参数：id 仓库主键；remote 远端名称。
+   * 返回值：Promise<void>。
+   */
+  async function showRemoteSshPreview(id, remote) {
+    let preview;
+    try {
+      preview = await api(`/api/repos/${id}/remote/ssh/preview`, {
+        method: 'POST',
+        body: { remote },
+      });
+    } catch (err) {
+      showModalError(`生成转换预览失败：${err.message}`);
+      return;
+    }
+    if (!preview.fetch_convertible && !preview.push_convertible) {
+      showModalError(preview.reason || '该远端地址不支持转换为 SSH。');
+      return;
+    }
+    const bothDisabled = !(preview.fetch_convertible && preview.push_convertible);
+    setModalBody(`
+      <div class="kv"><span>远端</span><strong>${escapeHtml(preview.remote)}</strong></div>
+      <div class="kv"><span>当前 fetch</span><strong class="full-text">${escapeHtml(preview.fetch_url)}</strong></div>
+      <div class="kv"><span>当前 push</span><strong class="full-text">${escapeHtml(preview.push_url)}</strong></div>
+      <div class="section-label" style="margin-top:14px">目标 SSH 地址</div>
+      <div class="kv"><span>fetch</span><strong class="full-text">${escapeHtml(preview.ssh_fetch_url || '（不支持转换）')}</strong></div>
+      <div class="kv"><span>push</span><strong class="full-text">${escapeHtml(preview.ssh_push_url || '（不支持转换）')}</strong></div>
+      <label class="check" style="margin-top:12px"><input type="radio" name="ssh-mode" value="both" ${bothDisabled ? 'disabled' : 'checked'}>
+        <span>同时修改 fetch 与 push（推荐）</span></label>
+      <label class="check"><input type="radio" name="ssh-mode" value="push" ${bothDisabled ? 'checked' : ''} ${preview.push_convertible ? '' : 'disabled'}>
+        <span>只修改 push</span></label>
+      <label class="check"><input type="radio" name="ssh-mode" value="fetch" ${preview.fetch_convertible ? '' : 'disabled'}>
+        <span>只修改 fetch</span></label>
+      <div class="hint">仅支持 github.com / gitee.com / gitlab.com；其他域名不猜测。修改后会记录审计（remote_set_url）。</div>
+      <div class="error-box" id="modal-error" hidden></div>
+    `);
+    setModalFoot(`<button class="btn btn-ghost" id="remote-back">返回</button>
+      <button class="btn btn-primary" id="remote-confirm">确认切换</button>`);
+    document.getElementById('remote-back').addEventListener('click', () => openRemoteModal(id));
+    document.getElementById('remote-confirm').addEventListener('click', async () => {
+      const modeInput = el.modalBody.querySelector('input[name="ssh-mode"]:checked');
+      const mode = modeInput ? modeInput.value : 'both';
+      const ok = await confirmDialog({
+        title: '修改远端地址',
+        message: `将把 ${preview.remote} 的地址切换为 SSH（模式：${mode === 'both' ? 'fetch + push' : mode === 'push' ? '仅 push' : '仅 fetch'}）。\n该修改会写入仓库配置并记录审计。`,
+        confirmLabel: '切换',
+      });
+      if (!ok) return;
+      try {
+        const result = await api(`/api/repos/${id}/remote/ssh`, {
+          method: 'POST',
+          body: { remote: preview.remote, mode, confirm: true },
+        });
+        await afterRepoAction(id, result, result.message || '远端已切换为 SSH。');
+      } catch (err) {
+        showModalError(err.message);
+      }
+    });
+  }
+
+  /**
+   * 打开 HTTPS 凭据面板：列出 cmdkey 中的 git 条目，支持清除与交互式登录。
+   * 参数：无。
+   * 返回值：Promise<void>。
+   */
+  async function openCredentialsModal() {
+    let data;
+    try {
+      data = await api('/api/credentials');
+    } catch (err) {
+      toast(`读取凭据失败：${err.message}`, 'error', 6000);
+      return;
+    }
+    const items = data.items || [];
+    const rows = items.length ? items.map((item) => `<div class="ignore-row">
+      <div class="ignore-main">
+        <div class="ignore-path full-text">${escapeHtml(item.host)}</div>
+        <div class="ignore-meta"><code class="rule-source full-text">${escapeHtml(item.target)}</code>
+          <button class="btn-link" data-copy="${escapeHtml(item.target)}" data-copy-label="凭据目标">复制</button>
+          <button class="btn-link is-danger" data-credential-delete="${escapeHtml(item.target)}">清除该 host 凭据</button>
+        </div>
+      </div>
+    </div>`).join('') : '<div class="commit-empty">未发现 git HTTPS 凭据。</div>';
+    openModal({
+      title: 'HTTPS 凭据',
+      wide: true,
+      body: `
+        <div class="hint">来自 Windows 凭据管理器（cmdkey），仅展示 host 与目标，不展示密码。</div>
+        <div class="ignore-section">${rows}</div>
+        <div class="hint">若推送报 403/401，可先清除对应 host 凭据，再重新登录；或把远端切换为 SSH 地址。</div>
+        ${data.message ? `<div class="hint">${escapeHtml(data.message)}</div>` : ''}
+        <details class="dirty-details">
+          <summary>查看 cmdkey 原始输出</summary>
+          <pre class="preview-block full-text">${escapeHtml(data.raw || '')}</pre>
+        </details>
+        <div class="error-box" id="modal-error" hidden></div>
+      `,
+      foot: `<button class="btn btn-ghost" id="credential-close">关闭</button>
+        <button class="btn btn-primary" id="credential-login">使用此账号登录（HTTPS）</button>`,
+    });
+    document.getElementById('credential-close').addEventListener('click', closeModal);
+    el.modalBody.querySelectorAll('[data-credential-delete]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const target = button.dataset.credentialDelete;
+        const ok = await confirmDialog({
+          title: '清除 HTTPS 凭据',
+          message: `将清除凭据目标：\n${target}\n\n下次推送会要求重新登录。该操作会记录审计。`,
+          confirmLabel: '清除',
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          const result = await api('/api/credentials/delete', {
+            method: 'POST',
+            body: { target, confirm: true },
+          });
+          toast(result.message || '已清除凭据。', 'success', 5000);
+          openCredentialsModal();
+        } catch (err) {
+          showModalError(err.message);
+        }
+      });
+    });
+    document.getElementById('credential-login').addEventListener('click', async () => {
+      const ok = await confirmDialog({
+        title: '交互式凭据登录',
+        message: '将在独立控制台窗口启动 Git Credential Manager 登录。\n登录过程可能需要你在窗口中输入账号或授权，本页面不会收集密码。',
+        confirmLabel: '打开登录窗口',
+      });
+      if (!ok) return;
+      try {
+        const result = await api('/api/credentials/login', {
+          method: 'POST',
+          body: { confirm: true },
+        });
+        const message = result.install_url
+          ? `${result.message}\n安装地址：${result.install_url}`
+          : result.message;
+        if (result.ok) toast(message, 'success', 7000);
+        else toast(message, 'warn', 9000);
+        if (result.launched) closeModal();
+      } catch (err) {
+        showModalError(err.message);
+      }
+    });
+  }
+
+  /**
+   * 渲染远端错误诊断卡片（标题、原因、可执行入口与原始输出）。
+   * 参数：containerId 容器元素 id；repoId 仓库主键；err 请求异常。
+   * 返回值：无。
+   */
+  function renderDiagnosis(containerId, repoId, err) {
+    const box = document.getElementById(containerId);
+    const payload = err && err.payload ? err.payload : {};
+    const diagnosis = payload.diagnosis;
+    if (!box || !diagnosis) return;
+    const actions = (diagnosis.suggestions || []).map((item) =>
+      `<button class="btn btn-ghost btn-sm" data-diag-key="${escapeHtml(item.key)}" title="${escapeHtml(item.hint || '')}">${escapeHtml(item.label)}</button>`
+    ).join('');
+    box.innerHTML = `<div class="diagnosis-card">
+      <div class="diagnosis-title">${escapeHtml(diagnosis.title)}</div>
+      <div class="diagnosis-detail">${escapeHtml(diagnosis.detail)}</div>
+      <div class="diagnosis-actions">${actions}</div>
+      <details class="raw-output">
+        <summary>查看原始输出（可复制）</summary>
+        <div class="kv"><span>命令</span><strong class="full-text">${escapeHtml(payload.command || '')}</strong></div>
+        <div class="kv"><span>退出码</span><strong>${escapeHtml(String(payload.exit_code == null ? '' : payload.exit_code))}</strong></div>
+        <pre class="preview-block full-text">${escapeHtml(payload.output || '')}</pre>
+        <button class="btn-link" data-copy="${escapeHtml(payload.output || '')}" data-copy-label="原始输出">复制原始输出</button>
+      </details>
+    </div>`;
+    box.querySelectorAll('[data-diag-key]').forEach((button) => {
+      button.addEventListener('click', () => runDiagnosisAction(button.dataset.diagKey, repoId));
+    });
+  }
+
+  /**
+   * 执行诊断卡片上的动作入口。
+   * 参数：key 动作标识；repoId 仓库主键。
+   * 返回值：无。
+   */
+  function runDiagnosisAction(key, repoId) {
+    if (key === 'use_ssh') {
+      closeModal();
+      openRemoteModal(repoId);
+      return;
+    }
+    if (key === 'https_credentials') {
+      closeModal();
+      openCredentialsModal();
+      return;
+    }
+    if (key === 'ssh_test' || key === 'manage_ssh') {
+      closeModal();
+      openRepoSshModal(repoId);
+      return;
+    }
+    if (key === 'pull') {
+      closeModal();
+      openPullModal(repoId);
+      return;
+    }
+    if (key === 'retry') {
+      const retryBtn = document.getElementById('push-confirm') || document.getElementById('pull-confirm');
+      if (retryBtn) retryBtn.click();
+      return;
+    }
+    if (key === 'view_audit') {
+      closeModal();
+      switchTab('audit');
+      loadAudit();
+    }
+  }
+
   function bindEvents() {
     el.tabs.forEach((tab) => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
 
@@ -2265,8 +2965,15 @@
     el.btnRoot.addEventListener('click', openRootsModal);
     el.btnSsh.addEventListener('click', openSshModal);
     el.btnScan.addEventListener('click', openScanModal);
+    if (el.btnCredentials) el.btnCredentials.addEventListener('click', openCredentialsModal);
 
     el.grid.addEventListener('click', (event) => {
+      const unmuteBtn = event.target.closest('[data-unmute]');
+      if (unmuteBtn) {
+        const repoId = Number(unmuteBtn.dataset.repo);
+        unmutePath(repoId, Number(unmuteBtn.dataset.unmute));
+        return;
+      }
       const button = event.target.closest('[data-act]');
       if (!button) return;
       const card = event.target.closest('.repo-card');
