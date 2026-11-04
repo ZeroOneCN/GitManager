@@ -15,10 +15,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .config import Settings
+from .config import Settings, path_is_under
 from .db import Database, now_iso
 from .domain import map_git_error, parse_ahead_behind, parse_status_porcelain_z
 from .git_runner import GitExecutor, GitResult
+from .scanner import ScanManager
+from .ssh_service import SshService
 
 
 class ApiError(Exception):
@@ -114,6 +116,361 @@ class GitManagerService:
         self.settings = settings
         self.database = database
         self.executor = executor
+        self.scanner = ScanManager(settings, database)
+        self.ssh = SshService(settings, database, executor)
+
+    # ------------------------------------------------------------------
+    # 白名单根目录（SQLite 持久化，.env 仅作首次种子）
+    # ------------------------------------------------------------------
+
+    def allowed_root_paths(self) -> tuple[Path, ...]:
+        """读取当前生效的白名单根目录。
+
+        参数：
+            无。
+        返回值：
+            已持久化根目录的 Path 元组（按添加顺序）。
+        """
+        return tuple(Path(item["path"]) for item in self.database.list_allowed_roots())
+
+    def _path_allowed(self, path: Path) -> bool:
+        """判断路径是否位于当前白名单内。
+
+        参数：
+            path: 已 resolve 的绝对路径。
+        返回值：
+            位于任一允许根目录时返回 True。
+        """
+        return path_is_under(path, self.allowed_root_paths())
+
+    def list_allowed_roots(self) -> dict[str, Any]:
+        """列出白名单根目录及其下受管仓库数量。
+
+        参数：
+            无。
+        返回值：
+            {"items": [{id, path, name, created_at, managed_repos}]}。
+        """
+        repos = self.database.list_repos()
+        items: list[dict[str, Any]] = []
+        for root in self.database.list_allowed_roots():
+            root_path = Path(root["path"])
+            managed = sum(
+                1
+                for repo in repos
+                if path_is_under(Path(repo["path"]), (root_path,))
+            )
+            items.append(
+                {
+                    "id": root["id"],
+                    "path": root["path"],
+                    "name": root_path.name or root["path"],
+                    "created_at": root["created_at"],
+                    "managed_repos": managed,
+                }
+            )
+        return {"items": items}
+
+    def add_allowed_root(self, raw_path: str) -> dict[str, Any]:
+        """新增白名单根目录（规范化、去尾部分隔符、大小写不敏感去重）。
+
+        参数：
+            raw_path: 用户提交的目录路径。
+        返回值：
+            {"item": {id, path, name, created_at, managed_repos}}。
+        异常：
+            ApiError: 路径非法、不存在或重复。
+        """
+        text = (raw_path or "").strip().strip('"')
+        if not text:
+            raise ApiError("invalid_root", "根目录路径不能为空。", 400)
+        candidate = Path(os.path.expandvars(text)).expanduser()
+        if not candidate.is_absolute():
+            raise ApiError("invalid_root", "请填写绝对路径。", 400)
+        try:
+            resolved = candidate.resolve()
+        except OSError as exc:
+            raise ApiError("invalid_root", f"路径无法解析：{exc}", 400)
+        if not resolved.is_dir():
+            raise ApiError("root_not_found", "目录不存在或不是目录。", 400)
+        existing = {
+            os.path.normcase(item["path"])
+            for item in self.database.list_allowed_roots()
+        }
+        if os.path.normcase(str(resolved)) in existing:
+            raise ApiError("root_duplicate", "该根目录已在白名单中。", 409)
+        try:
+            root_id = self.database.insert_allowed_root(str(resolved))
+        except sqlite3.IntegrityError:
+            raise ApiError("root_duplicate", "该根目录已在白名单中。", 409)
+        root = self.database.get_allowed_root(root_id) or {}
+        return {
+            "item": {
+                "id": root.get("id", root_id),
+                "path": root.get("path", str(resolved)),
+                "name": resolved.name or str(resolved),
+                "created_at": root.get("created_at"),
+                "managed_repos": 0,
+            },
+            "message": "根目录已加入白名单。",
+        }
+
+    def remove_allowed_root(self, root_id: int, force: bool = False) -> dict[str, Any]:
+        """移除白名单根目录；仍有受管仓库时需显式强制确认。
+
+        参数：
+            root_id: 根目录主键。
+            force: 是否在存在受管仓库时仍然移除。
+        返回值：
+            {"ok": True, "removed": {...}, "affected_repos": n, "message": ...}。
+        异常：
+            ApiError: 根目录不存在；存在受管仓库且未确认。
+        """
+        root = self.database.get_allowed_root(root_id)
+        if root is None:
+            raise ApiError("root_not_found", "白名单根目录不存在。", 404)
+        root_path = Path(root["path"])
+        affected = [
+            repo
+            for repo in self.database.list_repos()
+            if path_is_under(Path(repo["path"]), (root_path,))
+        ]
+        if affected and not force:
+            raise ApiError(
+                "root_in_use",
+                f"该根目录下仍有 {len(affected)} 个受管仓库。"
+                "移除后这些仓库将超出白名单而不可操作（仓库配置与磁盘数据不会自动删除）。",
+                409,
+                {
+                    "count": len(affected),
+                    "repos": [
+                        {"id": repo["id"], "name": repo["name"], "path": repo["path"]}
+                        for repo in affected[:10]
+                    ],
+                },
+            )
+        removed = self.database.delete_allowed_root(root_id)
+        return {
+            "ok": True,
+            "removed": removed,
+            "affected_repos": len(affected),
+            "message": "根目录已从白名单移除；受管仓库仍保留在列表中但暂不可操作。"
+            if affected
+            else "根目录已从白名单移除。",
+        }
+
+    # ------------------------------------------------------------------
+    # 仓库扫描
+    # ------------------------------------------------------------------
+
+    def start_scan(
+        self, raw_roots: list[str] | None, max_depth: int | None, limit: int | None
+    ) -> dict[str, Any]:
+        """启动只读仓库扫描任务。
+
+        参数：
+            raw_roots: 指定根目录列表；为空时扫描全部白名单根目录。
+            max_depth: 最大深度（默认取配置，限制 1-12）。
+            limit: 结果上限（默认取配置，限制 1-500）。
+        返回值：
+            扫描任务快照（含 job_id 与进度）。
+        异常：
+            ApiError: 根目录为空、不存在或不在白名单内。
+        """
+        allowed = self.allowed_root_paths()
+        if not allowed:
+            raise ApiError("no_allowed_roots", "白名单为空，请先添加根目录。", 400)
+        roots: list[Path] = []
+        for raw in raw_roots or []:
+            text = (raw or "").strip().strip('"')
+            if not text:
+                continue
+            candidate = Path(os.path.expandvars(text)).expanduser()
+            if not candidate.is_absolute():
+                raise ApiError("invalid_scan_root", f"扫描根目录必须是绝对路径：{text}", 400)
+            try:
+                resolved = candidate.resolve()
+            except OSError as exc:
+                raise ApiError("invalid_scan_root", f"路径无法解析：{exc}", 400)
+            if not resolved.is_dir():
+                raise ApiError("scan_root_not_found", f"扫描根目录不存在：{resolved}", 400)
+            if not path_is_under(resolved, allowed):
+                raise ApiError(
+                    "path_not_allowed",
+                    f"扫描根目录不在白名单内，已拒绝：{resolved}",
+                    400,
+                )
+            if resolved not in roots:
+                roots.append(resolved)
+        if not roots:
+            roots = list(allowed)
+        depth = max_depth if max_depth is not None else self.settings.scan_max_depth
+        depth = max(1, min(int(depth), 12))
+        cap = limit if limit is not None else self.settings.scan_result_limit
+        cap = max(1, min(int(cap), 500))
+        return self.scanner.start(roots, depth, cap)
+
+    def get_scan(self, job_id: str) -> dict[str, Any]:
+        """读取扫描任务进度。
+
+        参数：
+            job_id: 任务 id。
+        返回值：
+            任务快照。
+        异常：
+            ApiError: 任务不存在或已过期。
+        """
+        snapshot = self.scanner.get(job_id)
+        if snapshot is None:
+            raise ApiError("scan_not_found", "扫描任务不存在或已过期。", 404)
+        return snapshot
+
+    def cancel_scan(self, job_id: str) -> dict[str, Any]:
+        """取消扫描任务。
+
+        参数：
+            job_id: 任务 id。
+        返回值：
+            任务快照。
+        异常：
+            ApiError: 任务不存在。
+        """
+        snapshot = self.scanner.cancel(job_id)
+        if snapshot is None:
+            raise ApiError("scan_not_found", "扫描任务不存在或已过期。", 404)
+        return snapshot
+
+    # ------------------------------------------------------------------
+    # SSH 身份
+    # ------------------------------------------------------------------
+
+    def scan_ssh(self) -> dict[str, Any]:
+        """扫描本机 SSH 私钥与 Host 别名（只读）。
+
+        参数：
+            无。
+        返回值：
+            扫描结果（不含私钥内容）。
+        """
+        return self.ssh.scan()
+
+    def list_ssh_identities(self) -> dict[str, Any]:
+        """列出已配置的 SSH 身份。
+
+        参数：
+            无。
+        返回值：
+            {"items": [...], "default": {...} | None}。
+        """
+        items = self.ssh.list_identities()
+        default = next((item for item in items if item["is_default"]), None)
+        return {"items": items, "default": default}
+
+    def create_ssh_identity(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """创建 SSH 身份配置。
+
+        参数：
+            payload: 身份字段。
+        返回值：
+            {"item": 身份字典}。
+        异常：
+            ApiError: 字段非法或重复。
+        """
+        try:
+            item = self.ssh.create_identity(payload)
+        except ValueError as exc:
+            raise ApiError("invalid_ssh_identity", str(exc), 400)
+        return {"item": item, "message": "SSH 身份已保存。"}
+
+    def update_ssh_identity(self, identity_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        """更新 SSH 身份配置。
+
+        参数：
+            identity_id: 身份主键。
+            payload: 可部分更新字段。
+        返回值：
+            {"item": 身份字典}。
+        异常：
+            ApiError: 身份不存在或字段非法。
+        """
+        try:
+            item = self.ssh.update_identity(identity_id, payload)
+        except ValueError as exc:
+            raise ApiError("invalid_ssh_identity", str(exc), 400)
+        return {"item": item, "message": "SSH 身份已更新。"}
+
+    def delete_ssh_identity(self, identity_id: int) -> dict[str, Any]:
+        """删除 SSH 身份配置（不删除磁盘密钥）。
+
+        参数：
+            identity_id: 身份主键。
+        返回值：
+            {"ok": True, "removed": {...}, "message": ...}。
+        异常：
+            ApiError: 身份不存在。
+        """
+        try:
+            item = self.ssh.delete_identity(identity_id)
+        except ValueError as exc:
+            raise ApiError("ssh_identity_not_found", str(exc), 404)
+        return {
+            "ok": True,
+            "removed": item,
+            "message": "身份配置已删除（磁盘私钥文件未做改动）。",
+        }
+
+    def set_default_ssh_identity(self, identity_id: int) -> dict[str, Any]:
+        """设置全局默认 SSH 身份。
+
+        参数：
+            identity_id: 身份主键。
+        返回值：
+            {"item": 身份字典}。
+        异常：
+            ApiError: 身份不存在或已禁用。
+        """
+        try:
+            item = self.ssh.set_default(identity_id)
+        except ValueError as exc:
+            raise ApiError("invalid_ssh_identity", str(exc), 400)
+        return {"item": item, "message": "已设为全局默认身份。"}
+
+    def bind_repo_ssh_identity(self, repo_id: int, identity_id: int | None) -> dict[str, Any]:
+        """设置或清除仓库级 SSH 身份绑定。
+
+        参数：
+            repo_id: 仓库主键。
+            identity_id: 身份 id；None 表示清除绑定。
+        返回值：
+            {"effective": 生效身份 | None, "message": ...}。
+        异常：
+            ApiError: 仓库/身份不存在或已禁用。
+        """
+        repo = self.get_repo(repo_id)
+        try:
+            effective = self.ssh.bind_repo(repo["id"], identity_id)
+        except ValueError as exc:
+            raise ApiError("invalid_ssh_identity", str(exc), 400)
+        return {
+            "effective": effective,
+            "message": "仓库已绑定该 SSH 身份。" if identity_id is not None else "已清除仓库绑定，回落到全局默认。",
+        }
+
+    def test_ssh_identity(self, identity_id: int, host: str | None) -> dict[str, Any]:
+        """测试 SSH 身份连接（BatchMode，不交互）。
+
+        参数：
+            identity_id: 身份主键。
+            host: 可选覆盖的 Host 别名。
+        返回值：
+            测试结果。
+        异常：
+            ApiError: 身份不存在或缺少 Host。
+        """
+        try:
+            return self.ssh.test_connection(identity_id, host)
+        except ValueError as exc:
+            raise ApiError("invalid_ssh_identity", str(exc), 400)
 
     # ------------------------------------------------------------------
     # 仓库管理
@@ -160,19 +517,38 @@ class GitManagerService:
                 404,
                 {"repo": repo},
             )
+        if not self._path_allowed(path):
+            raise ApiError(
+                "path_not_allowed",
+                f"仓库已不在白名单根目录内，操作已拒绝：{repo['path']}。"
+                "请先在“允许的根目录”中添加对应根路径。",
+                403,
+                {"repo": repo},
+            )
         return path
+
+    def _network_identity(self, repo: dict[str, Any]) -> dict[str, Any] | None:
+        """解析仓库网络操作应使用的 SSH 身份。
+
+        参数：
+            repo: 仓库字典。
+        返回值：
+            生效身份字典；无可用身份时返回 None（走系统默认 SSH 配置）。
+        """
+        return self.ssh.resolve_for_repo(int(repo["id"]))
 
     def add_repositories(self, raw_paths: list[str]) -> dict[str, Any]:
         """批量添加仓库（逐条校验，允许部分成功）。
 
         参数：
-            raw_paths: 用户提交的路径字符串列表（最多 50 条）。
+            raw_paths: 用户提交的路径字符串列表（最多 500 条）。
         返回值：
             {"results": [{path, ok, repo_id?, name?, error?, duplicate?}], "added": n}。
         """
         results: list[dict[str, Any]] = []
         added = 0
-        for raw in raw_paths[:50]:
+        allowed_roots = self.allowed_root_paths()
+        for raw in raw_paths[:500]:
             text = (raw or "").strip().strip('"')
             if not text:
                 results.append(
@@ -202,8 +578,8 @@ class GitManagerService:
                     {"path": text, "ok": False, "error": "目录不存在或不是目录。"}
                 )
                 continue
-            if not self.settings.is_path_allowed(resolved):
-                roots = "、".join(str(root) for root in self.settings.allowed_roots)
+            if not path_is_under(resolved, allowed_roots):
+                roots = "、".join(str(root) for root in allowed_roots)
                 results.append(
                     {
                         "path": str(resolved),
@@ -227,7 +603,7 @@ class GitManagerService:
                 continue
 
             top_level = Path(detect.stdout.strip()).resolve()
-            if not self.settings.is_path_allowed(top_level):
+            if not path_is_under(top_level, allowed_roots):
                 results.append(
                     {
                         "path": str(resolved),
@@ -326,10 +702,18 @@ class GitManagerService:
         返回值：
             [{path, name, is_repo}]。
         """
-        return [
-            {"path": str(root), "name": root.name or str(root), "is_repo": self._is_git_dir(root)}
-            for root in self.settings.allowed_roots
-        ]
+        items: list[dict[str, Any]] = []
+        for root in self.database.list_allowed_roots():
+            path = Path(root["path"])
+            items.append(
+                {
+                    "id": root["id"],
+                    "path": str(path),
+                    "name": path.name or str(path),
+                    "is_repo": self._is_git_dir(path),
+                }
+            )
+        return items
 
     def _is_git_dir(self, path: Path) -> bool:
         """判断目录是否直接包含 .git（普通仓库）。
@@ -370,7 +754,7 @@ class GitManagerService:
             }
 
         resolved = Path(text).expanduser().resolve()
-        if not self.settings.is_path_allowed(resolved):
+        if not self._path_allowed(resolved):
             raise ApiError(
                 "path_not_allowed",
                 "该路径不在白名单根目录内，无法浏览。",
@@ -382,10 +766,10 @@ class GitManagerService:
         parent: str | None = None
         if not any(
             os.path.normcase(str(resolved)) == os.path.normcase(str(root))
-            for root in self.settings.allowed_roots
+            for root in self.allowed_root_paths()
         ):
             candidate_parent = resolved.parent
-            if self.settings.is_path_allowed(candidate_parent):
+            if self._path_allowed(candidate_parent):
                 parent = str(candidate_parent)
 
         entries: list[dict[str, Any]] = []
@@ -563,14 +947,22 @@ class GitManagerService:
             "files": {"staged": [], "modified": [], "untracked": [], "conflicts": []},
             "last_commit": None,
             "last_fetch_at": None,
+            "ssh_identity": None,
             "error": None,
             "checked_at": now_iso(),
         }
+        base["ssh_identity"] = self._network_identity(repo)
         repo_path = Path(repo["path"])
         if not repo_path.is_dir():
             base["error"] = {
                 "code": "repo_missing",
                 "message": "仓库目录不存在（可能已被移动或删除）。",
+            }
+            return base
+        if not self._path_allowed(repo_path):
+            base["error"] = {
+                "code": "path_not_allowed",
+                "message": "仓库已不在白名单根目录内，状态读取已停止。",
             }
             return base
 
@@ -663,7 +1055,11 @@ class GitManagerService:
         repo = self.get_repo(repo_id)
         self._ensure_repo_dir(repo)
         result = self.executor.run(
-            repo["id"], repo["path"], "fetch", ["fetch", "--prune"]
+            repo["id"],
+            repo["path"],
+            "fetch",
+            ["fetch", "--prune"],
+            ssh_identity=self._network_identity(repo),
         )
         if not result.ok:
             raise _error_from_result("fetch", result, status_code=502)
@@ -719,7 +1115,11 @@ class GitManagerService:
             stash_used = True
 
         pull_res = self.executor.run(
-            repo["id"], repo["path"], "pull", ["pull", "--ff-only"]
+            repo["id"],
+            repo["path"],
+            "pull",
+            ["pull", "--ff-only"],
+            ssh_identity=self._network_identity(repo),
         )
         stash_state = {
             "used": stash_used,
@@ -891,6 +1291,7 @@ class GitManagerService:
                 repo["path"],
                 "push_set_upstream",
                 ["push", "--set-upstream", remote_name, branch],
+                ssh_identity=self._network_identity(repo),
             )
             action_text = f"已设置 upstream 并推送 {branch} → {remote_name}/{branch}"
             forced = False
@@ -909,12 +1310,17 @@ class GitManagerService:
                     "push_force",
                     ["push", "--force-with-lease"],
                     forced=True,
+                    ssh_identity=self._network_identity(repo),
                 )
                 action_text = f"已强制推送（--force-with-lease）{branch} → {upstream}"
                 forced = True
             else:
                 push_res = self.executor.run(
-                    repo["id"], repo["path"], "push", ["push"]
+                    repo["id"],
+                    repo["path"],
+                    "push",
+                    ["push"],
+                    ssh_identity=self._network_identity(repo),
                 )
                 action_text = f"已推送 {branch} → {upstream}"
                 forced = False

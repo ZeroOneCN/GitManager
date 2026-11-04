@@ -17,8 +17,10 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -29,6 +31,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import load_settings  # noqa: E402
+from app.git_runner import build_ssh_command  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -111,6 +114,79 @@ def run_git(git_exe: str, args: list[str], cwd: Path | None = None, check: bool 
     return completed
 
 
+def run_tool(executable: str, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    """执行非 git 的本地工具（例如 ssh-keygen），仅用于自测准备。
+
+    参数：
+        executable: 可执行文件路径。
+        args: 参数数组。
+        timeout: 超时秒数。
+    返回值：
+        subprocess.CompletedProcess（调用方自行判断 returncode）。
+    """
+    return subprocess.run(
+        [executable, *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        shell=False,
+    )
+
+
+def force_rmtree(path: Path) -> None:
+    """尽力删除目录：遇到只读文件（git 松散对象）时清除属性后重试。
+
+    参数：
+        path: 要删除的目录。
+    返回值：
+        无。
+    """
+
+    def handle_error(func, target, _exc):
+        """删除失败时清除只读属性并重试一次。
+
+        参数：
+            func: shutil 内部使用的删除函数。
+            target: 出错路径。
+            _exc: 异常对象（未使用）。
+        返回值：
+            无。
+        """
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    if not path.exists():
+        return
+    shutil.rmtree(path, onexc=handle_error)
+
+
+def wait_scan(base: str, job_id: str, timeout: float = 30.0) -> dict:
+    """轮询扫描任务直到结束。
+
+    参数：
+        base: 服务根地址。
+        job_id: 扫描任务 id。
+        timeout: 最长等待秒数。
+    返回值：
+        任务快照；超时返回最后一次拿到的快照（可能为空字典）。
+    """
+    deadline = time.time() + timeout
+    snapshot: dict = {}
+    while time.time() < deadline:
+        status, data = http_call("GET", base, f"/api/scan/{job_id}", timeout=10)
+        if status == 200 and data:
+            snapshot = data
+            if data.get("status") in {"done", "error", "cancelled"}:
+                return snapshot
+        time.sleep(0.15)
+    return snapshot
+
+
 def configure_identity(git_exe: str, repo: Path) -> None:
     """为测试仓库设置本地提交身份。
 
@@ -185,6 +261,10 @@ def main() -> int:
     clone_dir = test_root / "clone"
     noup_dir = test_root / "noup"
     notrepo_dir = test_root / "notrepo"
+    scan_root = test_root / "scanroot"
+    ssh_repo_dir = test_root / "ssh-repo"
+    ssh_dir = test_root / "ssh"
+    extra_root: Path | None = None
     selftest_db = PROJECT_ROOT / "data" / "selftest.db"
     server_log = PROJECT_ROOT / "data" / "selftest_server.log"
     server: subprocess.Popen | None = None
@@ -212,15 +292,26 @@ def main() -> int:
             except OSError:
                 pass
             log_handle = None
+        if extra_root is not None and extra_root.exists():
+            force_rmtree(extra_root)
         if keep:
             print(f"已保留临时数据：{test_root}；数据库：{selftest_db}")
             return
-        shutil.rmtree(test_root, ignore_errors=True)
-        for _attempt in range(4):
+        # 目录联接需先单独移除，避免 rmtree 在 Windows 上留下残留
+        junction_dir = test_root / "scanroot" / "loop"
+        if junction_dir.exists():
+            try:
+                os.rmdir(junction_dir)
+            except OSError:
+                pass
+        # Windows 上服务退出后可能存在短暂文件句柄残留，多次重试删除
+        time.sleep(0.5)
+        force_rmtree(test_root)
+        for _attempt in range(10):
             if not test_root.exists():
                 break
-            time.sleep(0.6)
-            shutil.rmtree(test_root, ignore_errors=True)
+            time.sleep(1.0)
+            force_rmtree(test_root)
         try:
             if test_base.exists() and not any(test_base.iterdir()):
                 test_base.rmdir()
@@ -241,10 +332,25 @@ def main() -> int:
             except OSError:
                 pass
 
+    def make_repo(path: Path) -> None:
+        """创建一个带初始提交的真实 Git 仓库（扫描与绑定测试使用）。
+
+        参数：
+            path: 仓库目录。
+        返回值：
+            无。
+        """
+        path.mkdir(parents=True, exist_ok=True)
+        run_git(git_exe, ["init", "-b", "main", str(path)])
+        configure_identity(git_exe, path)
+        write_file(path / "README.md", f"# {path.name}\n")
+        run_git(git_exe, ["add", "."], cwd=path)
+        run_git(git_exe, ["commit", "-m", "chore: scan fixture"], cwd=path)
+
     try:
         # ---------- 1. 准备真实仓库 ----------
         if test_root.exists():
-            shutil.rmtree(test_root, ignore_errors=True)
+            force_rmtree(test_root)
         test_root.mkdir(parents=True, exist_ok=True)
 
         run_git(git_exe, ["init", "--bare", "-b", "main", str(remote_dir)])
@@ -257,6 +363,39 @@ def main() -> int:
         run_git(git_exe, ["push", "-u", "origin", "main"], cwd=work_dir)
         check("准备带 upstream 的测试仓库", True, str(work_dir))
 
+        # ---------- 1.1 准备 SSH 测试目录（使用 ssh-keygen 生成临时密钥） ----------
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        key_a = ssh_dir / "id_ed25519"
+        key_b = ssh_dir / "custom_work_key"
+        for key_path, comment in ((key_a, "selftest@gitmanager"), (key_b, "work@selftest")):
+            run_tool(
+                settings.ssh_keygen_executable,
+                ["-q", "-t", "ed25519", "-N", "", "-C", comment, "-f", str(key_path)],
+            )
+        write_file(
+            ssh_dir / "config",
+            "\n".join(
+                [
+                    "Host selftest-a",
+                    "    HostName 127.0.0.1",
+                    "    User git",
+                    f'    IdentityFile "{str(key_a).replace(os.sep, "/")}"',
+                    "",
+                    "Host selftest-b",
+                    "    HostName 127.0.0.1",
+                    "    User git",
+                    f'    IdentityFile "{str(key_b).replace(os.sep, "/")}"',
+                    "",
+                ]
+            ),
+        )
+        check(
+            "准备 SSH 临时密钥与 config（仅用于身份扫描）",
+            key_a.is_file() and key_a.with_name(key_a.name + ".pub").is_file()
+            and key_b.is_file() and (ssh_dir / "config").is_file(),
+            str(ssh_dir),
+        )
+
         # ---------- 2. 启动真实服务 ----------
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.settimeout(0.5)
@@ -268,6 +407,8 @@ def main() -> int:
 
         env = os.environ.copy()
         env["GITMANAGER_DB"] = str(selftest_db)
+        # 指向自测专用 SSH 目录，避免读取开发者真实 ~/.ssh
+        env["SSH_DIR"] = str(ssh_dir)
         server_log.parent.mkdir(parents=True, exist_ok=True)
         log_handle = open(server_log, "w", encoding="utf-8")
         server = subprocess.Popen(
@@ -651,6 +792,465 @@ def main() -> int:
             "移除仓库后审计历史仍保留",
             status == 200 and (history or {}).get("total", 0) > 0,
             f"history={(history or {}).get('total')}",
+        )
+
+        # ---------- 13. 仓库扫描（只读、跳过噪音、深度与结果上限） ----------
+        make_repo(scan_root / "repo-a")
+        make_repo(scan_root / "group" / "repo-b")
+        make_repo(scan_root / "node_modules" / "noise-repo")
+        make_repo(scan_root / ".venv" / "noise-repo2")
+        make_repo(scan_root / "deep" / "a" / "b" / "repo-deep")
+        junction = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(scan_root / "loop"), str(scan_root)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+        )
+        check(
+            "准备扫描夹具（噪音目录、超深目录与目录联接）",
+            True,
+            "目录联接已创建"
+            if junction.returncode == 0
+            else f"环境不支持目录联接，循环测试降级：{(junction.stderr or '').strip()[:80]}",
+        )
+
+        status, scan_job = http_call(
+            "POST",
+            base,
+            "/api/scan/start",
+            {"roots": [str(scan_root)], "max_depth": 3, "limit": 50},
+        )
+        scan_job_id = (scan_job or {}).get("job_id") or ""
+        check(
+            "扫描任务启动并返回 job_id",
+            status == 200 and bool(scan_job_id),
+            str((scan_job or {}).get("status")),
+        )
+        scan_snapshot = wait_scan(base, scan_job_id)
+        scan_items = scan_snapshot.get("items") or []
+        scanned_paths = {os.path.normcase(item.get("path", "")) for item in scan_items}
+        repo_a_path = os.path.normcase(str(scan_root / "repo-a"))
+        repo_b_path = os.path.normcase(str(scan_root / "group" / "repo-b"))
+        noise_node = os.path.normcase(str(scan_root / "node_modules" / "noise-repo"))
+        noise_venv = os.path.normcase(str(scan_root / ".venv" / "noise-repo2"))
+        deep_repo = os.path.normcase(str(scan_root / "deep" / "a" / "b" / "repo-deep"))
+        check("扫描任务完成", scan_snapshot.get("status") == "done", str(scan_snapshot.get("status")))
+        check(
+            "扫描识别真实仓库（含嵌套目录）",
+            repo_a_path in scanned_paths and repo_b_path in scanned_paths,
+            f"found={len(scan_items)} paths={[item.get('path') for item in scan_items]}",
+        )
+        check(
+            "扫描跳过 node_modules / .venv 噪音目录",
+            noise_node not in scanned_paths and noise_venv not in scanned_paths,
+            f"found={len(scan_items)}",
+        )
+        check("扫描遵守最大深度限制", deep_repo not in scanned_paths, f"found={len(scan_items)}")
+        check(
+            "扫描进度包含已访问目录数",
+            int(scan_snapshot.get("scanned_dirs") or 0) >= 4,
+            f"scanned_dirs={scan_snapshot.get('scanned_dirs')}",
+        )
+        check(
+            "扫描未因目录联接陷入循环",
+            scan_snapshot.get("status") == "done" and int(scan_snapshot.get("scanned_dirs") or 0) < 200,
+            f"scanned_dirs={scan_snapshot.get('scanned_dirs')}",
+        )
+        repo_a_item = next(
+            (item for item in scan_items if os.path.normcase(item.get("path", "")) == repo_a_path),
+            {},
+        )
+        check(
+            "扫描结果包含当前分支且标记未管理",
+            repo_a_item.get("branch") == "main"
+            and repo_a_item.get("detached") is False
+            and repo_a_item.get("managed") is False,
+            str(repo_a_item),
+        )
+
+        status, limited_job = http_call(
+            "POST",
+            base,
+            "/api/scan/start",
+            {"roots": [str(scan_root)], "max_depth": 3, "limit": 2},
+        )
+        limited_snapshot = wait_scan(base, (limited_job or {}).get("job_id") or "")
+        check(
+            "扫描结果上限生效并标记截断",
+            limited_snapshot.get("status") == "done"
+            and limited_snapshot.get("truncated") is True
+            and limited_snapshot.get("found") == 2,
+            f"found={limited_snapshot.get('found')} truncated={limited_snapshot.get('truncated')}",
+        )
+
+        status, bad_scan = http_call("POST", base, "/api/scan/start", {"roots": ["C:\\Windows"]})
+        check(
+            "白名单外扫描根目录被拒绝",
+            status == 400 and (bad_scan or {}).get("code") == "path_not_allowed",
+            str((bad_scan or {}).get("code")),
+        )
+        status, rel_scan = http_call("POST", base, "/api/scan/start", {"roots": ["relative-dir"]})
+        check(
+            "相对扫描根目录被拒绝",
+            status == 400 and (rel_scan or {}).get("code") == "invalid_scan_root",
+            str((rel_scan or {}).get("code")),
+        )
+        status, missing_scan = http_call("GET", base, "/api/scan/not-a-job")
+        check(
+            "未知扫描任务返回 404",
+            status == 404 and (missing_scan or {}).get("code") == "scan_not_found",
+            str((missing_scan or {}).get("code")),
+        )
+
+        # ---------- 14. 扫描结果批量添加 ----------
+        status, batch = http_call(
+            "POST",
+            base,
+            "/api/repos",
+            {"paths": [str(scan_root / "repo-a"), str(scan_root / "group" / "repo-b")]},
+        )
+        batch_results = (batch or {}).get("results") or []
+        repo_a_id = int((batch_results[0] or {}).get("repo_id") or 0) if batch_results else 0
+        repo_b_id = int((batch_results[1] or {}).get("repo_id") or 0) if len(batch_results) > 1 else 0
+        check(
+            "扫描结果可一键批量加入管理列表",
+            status == 200
+            and len(batch_results) == 2
+            and all(item.get("ok") for item in batch_results)
+            and repo_a_id > 0
+            and repo_b_id > 0,
+            json.dumps(batch_results, ensure_ascii=False)[:200],
+        )
+        status, rescan_job = http_call(
+            "POST",
+            base,
+            "/api/scan/start",
+            {"roots": [str(scan_root)], "max_depth": 3, "limit": 50},
+        )
+        rescan_snapshot = wait_scan(base, (rescan_job or {}).get("job_id") or "")
+        check(
+            "再次扫描把已加入仓库标记为已管理",
+            rescan_snapshot.get("status") == "done"
+            and int(rescan_snapshot.get("managed_count") or 0) >= 2,
+            f"managed_count={rescan_snapshot.get('managed_count')}",
+        )
+
+        # ---------- 15. 多根白名单管理 ----------
+        status, roots_before = http_call("GET", base, "/api/allowed-roots")
+        check(
+            "白名单列表包含 .env 初始根目录",
+            status == 200 and len((roots_before or {}).get("items") or []) >= 1,
+            f"count={len((roots_before or {}).get('items') or [])}",
+        )
+        status, root_added = http_call(
+            "POST", base, "/api/allowed-roots", {"path": str(scan_root) + os.sep}
+        )
+        added_item = (root_added or {}).get("item") or {}
+        scan_root_id = int(added_item.get("id") or 0)
+        check(
+            "新增白名单根目录并规范化尾部分隔符",
+            status == 200
+            and scan_root_id > 0
+            and os.path.normcase(added_item.get("path", "")) == os.path.normcase(str(scan_root)),
+            str(added_item.get("path")),
+        )
+        status, dup_root = http_call(
+            "POST", base, "/api/allowed-roots", {"path": str(scan_root).upper()}
+        )
+        check(
+            "重复根目录（大小写不敏感）被拒绝",
+            status == 409 and (dup_root or {}).get("code") == "root_duplicate",
+            str((dup_root or {}).get("code")),
+        )
+        status, missing_root = http_call(
+            "POST", base, "/api/allowed-roots", {"path": str(test_root / "missing-root")}
+        )
+        check(
+            "不存在的根目录被拒绝",
+            status == 400 and (missing_root or {}).get("code") == "root_not_found",
+            str((missing_root or {}).get("code")),
+        )
+        status, relative_root = http_call(
+            "POST", base, "/api/allowed-roots", {"path": "_gitmanager_selftest"}
+        )
+        check(
+            "相对路径根目录被拒绝",
+            status == 400 and (relative_root or {}).get("code") == "invalid_root",
+            str((relative_root or {}).get("code")),
+        )
+        status, root_in_use = http_call("DELETE", base, f"/api/allowed-roots/{scan_root_id}")
+        check(
+            "仍有受管仓库时移除白名单被拒绝",
+            status == 409
+            and (root_in_use or {}).get("code") == "root_in_use"
+            and int((root_in_use or {}).get("count") or 0) >= 2,
+            f"count={(root_in_use or {}).get('count')}",
+        )
+        status, root_forced = http_call(
+            "DELETE", base, f"/api/allowed-roots/{scan_root_id}?force=true"
+        )
+        check(
+            "强制移除白名单根目录",
+            status == 200 and (root_forced or {}).get("ok") is True,
+            f"affected={(root_forced or {}).get('affected_repos')}",
+        )
+        status, restored_root = http_call(
+            "POST", base, "/api/allowed-roots", {"path": str(scan_root)}
+        )
+        check("重新加入白名单", status == 200, str(((restored_root or {}).get("item") or {}).get("path")))
+        status, restored_status = http_call("GET", base, f"/api/repos/{repo_a_id}/status")
+        check(
+            "重新加入后恢复仓库操作",
+            status == 200 and bool((restored_status or {}).get("repo")),
+            f"HTTP {status}",
+        )
+
+        # 使用工作区之外的独立根目录，验证“移除白名单后拒绝操作”
+        extra_root = Path(tempfile.mkdtemp(prefix="gitmanager_selftest_extra_"))
+        make_repo(extra_root / "repo-x")
+        status, extra_added = http_call(
+            "POST", base, "/api/allowed-roots", {"path": str(extra_root)}
+        )
+        extra_root_id = int(((extra_added or {}).get("item") or {}).get("id") or 0)
+        check(
+            "新增工作区之外的临时白名单根目录",
+            status == 200 and extra_root_id > 0,
+            str(extra_root),
+        )
+        status, extra_repo_added = http_call(
+            "POST", base, "/api/repos", {"paths": [str(extra_root / "repo-x")]}
+        )
+        extra_repo_id = int(((((extra_repo_added or {}).get("results") or [{}])[0]).get("repo_id")) or 0)
+        check(
+            "添加临时根目录下的仓库",
+            status == 200 and extra_repo_id > 0,
+            f"repo_id={extra_repo_id}",
+        )
+        status, extra_removed = http_call(
+            "DELETE", base, f"/api/allowed-roots/{extra_root_id}?force=true"
+        )
+        check(
+            "移除临时根目录",
+            status == 200 and (extra_removed or {}).get("ok") is True,
+            str((extra_removed or {}).get("affected_repos")),
+        )
+        status, blocked = http_call("GET", base, f"/api/repos/{extra_repo_id}/status")
+        check(
+            "白名单外仓库操作被拒绝",
+            status == 403 and (blocked or {}).get("code") == "path_not_allowed",
+            str((blocked or {}).get("code")),
+        )
+
+        # ---------- 16. SSH 私钥扫描 ----------
+        status, ssh_scan = http_call("GET", base, "/api/ssh/scan")
+        ssh_scan = ssh_scan or {}
+        key_items = {item.get("name"): item for item in ssh_scan.get("keys") or []}
+        info_a = key_items.get("id_ed25519") or {}
+        check(
+            "SSH 扫描发现私钥并读取公钥指纹",
+            status == 200
+            and bool(info_a.get("public_key_path"))
+            and str(info_a.get("fingerprint") or "").startswith("SHA256:"),
+            str(info_a.get("fingerprint")),
+        )
+        check(
+            "SSH config Host 别名被解析并关联到私钥",
+            "selftest-a" in (ssh_scan.get("hosts") or [])
+            and (info_a.get("host_aliases") or []) == ["selftest-a"],
+            f"hosts={ssh_scan.get('hosts')} aliases={info_a.get('host_aliases')}",
+        )
+        check(
+            "SSH 扫描结果不包含私钥正文",
+            "BEGIN OPENSSH PRIVATE KEY" not in json.dumps(ssh_scan, ensure_ascii=False),
+            "已确认无私钥内容",
+        )
+        check(
+            "SSH 目录与 config 状态可读",
+            ssh_scan.get("ssh_dir_exists") is True and ssh_scan.get("config_exists") is True,
+            str(ssh_scan.get("ssh_dir")),
+        )
+
+        # ---------- 17. SSH 身份 CRUD、默认与仓库绑定 ----------
+        status, created_a = http_call(
+            "POST",
+            base,
+            "/api/ssh/identities",
+            {"name": "自测默认身份", "key_path": str(key_a), "host_alias": "selftest-a"},
+        )
+        identity_a_id = int(((created_a or {}).get("item") or {}).get("id") or 0)
+        check("新增 SSH 身份", status == 200 and identity_a_id > 0, str((created_a or {}).get("message")))
+        status, dup_identity = http_call(
+            "POST",
+            base,
+            "/api/ssh/identities",
+            {"name": "重复身份", "key_path": str(key_a), "host_alias": "selftest-a"},
+        )
+        check(
+            "重复私钥+别名身份被拒绝",
+            status == 400 and (dup_identity or {}).get("code") == "invalid_ssh_identity",
+            str((dup_identity or {}).get("code")),
+        )
+        status, bad_alias = http_call(
+            "POST",
+            base,
+            "/api/ssh/identities",
+            {"name": "非法别名", "key_path": str(key_a), "host_alias": "bad host!"},
+        )
+        check("非法 Host 别名被拒绝", status == 400, str((bad_alias or {}).get("code")))
+        status, bad_key = http_call(
+            "POST",
+            base,
+            "/api/ssh/identities",
+            {"name": "非法私钥", "key_path": str(work_dir / "README.md"), "host_alias": ""},
+        )
+        check("非私钥文件被拒绝", status == 400, str((bad_key or {}).get("code")))
+        status, created_b = http_call(
+            "POST",
+            base,
+            "/api/ssh/identities",
+            {"name": "自测工作密钥", "key_path": str(key_b), "host_alias": "selftest-b"},
+        )
+        identity_b_id = int(((created_b or {}).get("item") or {}).get("id") or 0)
+        check("新增第二个 SSH 身份", status == 200 and identity_b_id > 0, str(identity_b_id))
+
+        identity_a_name = "自测默认身份（改名）"
+        status, renamed = http_call(
+            "PATCH", base, f"/api/ssh/identities/{identity_a_id}", {"name": identity_a_name}
+        )
+        check(
+            "编辑身份显示名",
+            status == 200 and ((renamed or {}).get("item") or {}).get("name") == identity_a_name,
+            str(((renamed or {}).get("item") or {}).get("name")),
+        )
+        status, default_set = http_call("POST", base, f"/api/ssh/identities/{identity_a_id}/default")
+        status, settings_after = http_call("GET", base, "/api/settings")
+        check(
+            "设置全局默认身份并写入运行配置",
+            status == 200
+            and ((default_set or {}).get("item") or {}).get("is_default") is True
+            and (((settings_after or {}).get("default_ssh_identity") or {}).get("name") == identity_a_name),
+            str((settings_after or {}).get("default_ssh_identity")),
+        )
+        status, disabled = http_call(
+            "PATCH", base, f"/api/ssh/identities/{identity_b_id}", {"enabled": False}
+        )
+        check(
+            "禁用 SSH 身份",
+            status == 200 and ((disabled or {}).get("item") or {}).get("enabled") is False,
+            str(((disabled or {}).get("item") or {}).get("enabled")),
+        )
+        status, bind_disabled = http_call(
+            "PUT", base, f"/api/repos/{repo_a_id}/ssh-identity", {"identity_id": identity_b_id}
+        )
+        check(
+            "已禁用身份不能被仓库绑定",
+            status == 400 and "禁用" in ((bind_disabled or {}).get("message") or ""),
+            str((bind_disabled or {}).get("message")),
+        )
+        status, bound = http_call(
+            "PUT", base, f"/api/repos/{repo_a_id}/ssh-identity", {"identity_id": identity_a_id}
+        )
+        check(
+            "仓库级绑定优先于全局默认",
+            status == 200 and ((bound or {}).get("effective") or {}).get("source") == "repo",
+            str((bound or {}).get("effective")),
+        )
+        status, status_a = http_call("GET", base, f"/api/repos/{repo_a_id}/status")
+        check(
+            "体检状态显示生效 SSH 身份",
+            status == 200
+            and (((status_a or {}).get("ssh_identity") or {}).get("name") == identity_a_name),
+            str((status_a or {}).get("ssh_identity")),
+        )
+
+        # ---------- 18. SSH 连接测试与推送身份注入 ----------
+        status, ssh_test = http_call(
+            "POST", base, f"/api/ssh/identities/{identity_a_id}/test", {"host": "127.0.0.1"}
+        )
+        check(
+            "SSH 连接测试返回可读结果（未实测真实认证）",
+            status == 200
+            and (ssh_test or {}).get("status") in {"auth_failed", "host_unreachable", "error", "timeout"}
+            and bool((ssh_test or {}).get("output")),
+            f"status={(ssh_test or {}).get('status')} output={((ssh_test or {}).get('output') or '')[:80]}",
+        )
+
+        expected_ssh_command = build_ssh_command(settings.ssh_executable, str(key_a))
+        check(
+            "GIT_SSH_COMMAND 含 IdentitiesOnly 与 -i 且不拼进命令行",
+            "IdentitiesOnly=yes" in expected_ssh_command and f'-i "{str(key_a).replace(chr(92), "/")}"' in expected_ssh_command,
+            expected_ssh_command,
+        )
+
+        make_repo(ssh_repo_dir)
+        run_git(
+            git_exe,
+            ["remote", "add", "origin", "ssh://127.0.0.1:1/selftest.git"],
+            cwd=ssh_repo_dir,
+        )
+        run_git(git_exe, ["config", "branch.main.remote", "origin"], cwd=ssh_repo_dir)
+        run_git(git_exe, ["config", "branch.main.merge", "refs/heads/main"], cwd=ssh_repo_dir)
+        status, ssh_added = http_call("POST", base, "/api/repos", {"paths": [str(ssh_repo_dir)]})
+        ssh_repo_id = int(((((ssh_added or {}).get("results") or [{}])[0]).get("repo_id")) or 0)
+        check("添加 SSH 远端测试仓库", status == 200 and ssh_repo_id > 0, f"repo_id={ssh_repo_id}")
+        status, ssh_bind = http_call(
+            "PUT", base, f"/api/repos/{ssh_repo_id}/ssh-identity", {"identity_id": identity_a_id}
+        )
+        check("绑定身份到 SSH 远端仓库", status == 200, str((ssh_bind or {}).get("effective")))
+        status, ssh_push = http_call(
+            "POST",
+            base,
+            f"/api/repos/{ssh_repo_id}/push",
+            {"set_upstream": True, "remote": "origin"},
+        )
+        check(
+            "SSH 远端推送失败但错误可读",
+            status >= 400
+            and bool((ssh_push or {}).get("output") or (ssh_push or {}).get("message")),
+            f"HTTP {status} code={(ssh_push or {}).get('code')}",
+        )
+        status, push_audit = http_call(
+            "GET", base, f"/api/audit?action=push_set_upstream&repo_id={ssh_repo_id}&limit=5"
+        )
+        push_rows = (push_audit or {}).get("items") or []
+        check(
+            "推送审计记录 SSH 身份名",
+            status == 200 and bool(push_rows) and push_rows[0].get("identity_name") == identity_a_name,
+            str(push_rows[0].get("identity_name")) if push_rows else "no rows",
+        )
+        check(
+            "审计命令文本不包含私钥路径",
+            bool(push_rows) and "id_ed25519" not in (push_rows[0].get("command") or ""),
+            str(push_rows[0].get("command")) if push_rows else "",
+        )
+        status, test_audit = http_call("GET", base, "/api/audit?action=ssh_test&limit=5")
+        test_rows = (test_audit or {}).get("items") or []
+        check(
+            "SSH 连接测试审计记录身份名",
+            status == 200 and bool(test_rows) and test_rows[0].get("identity_name") == identity_a_name,
+            str(test_rows[0].get("identity_name")) if test_rows else "no rows",
+        )
+
+        # ---------- 19. 删除身份配置（不删除磁盘密钥） ----------
+        del_status, deleted_b = http_call("DELETE", base, f"/api/ssh/identities/{identity_b_id}")
+        status, identities_now = http_call("GET", base, "/api/ssh/identities")
+        check(
+            "删除身份配置但保留磁盘密钥文件",
+            del_status == 200
+            and (deleted_b or {}).get("ok") is True
+            and key_b.is_file()
+            and all(item.get("id") != identity_b_id for item in (identities_now or {}).get("items") or []),
+            f"key_exists={key_b.is_file()}",
+        )
+        status, unbound = http_call(
+            "PUT", base, f"/api/repos/{repo_a_id}/ssh-identity", {"identity_id": None}
+        )
+        check(
+            "清除仓库绑定后回落全局默认",
+            status == 200 and ((unbound or {}).get("effective") or {}).get("source") == "default",
+            str((unbound or {}).get("effective")),
         )
 
         return 0 if all(ok for _, ok, _ in RESULTS) else 1

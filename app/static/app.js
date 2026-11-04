@@ -21,6 +21,10 @@
       onlyFailed: false,
     },
     browse: null,
+    scan: null,
+    roots: null,
+    ssh: null,
+    sshDraft: { editingId: null, testOutput: null },
   };
 
   const el = {
@@ -34,6 +38,10 @@
     btnRefresh: document.getElementById('btn-refresh'),
     btnAdd: document.getElementById('btn-add'),
     btnAddEmpty: document.getElementById('btn-add-empty'),
+    btnRoot: document.getElementById('btn-root'),
+    btnSsh: document.getElementById('btn-ssh'),
+    btnScan: document.getElementById('btn-scan'),
+    identityStrip: document.getElementById('identity-strip'),
     toastStack: document.getElementById('toast-stack'),
     backdrop: document.getElementById('modal-backdrop'),
     modal: document.getElementById('modal'),
@@ -73,6 +81,8 @@
     push_force_blocked: '强制推送被拒绝',
     stage: '暂存文件',
     commit: '提交',
+    ssh_test: 'SSH 连接测试',
+    scan: '扫描仓库',
   };
 
   // ------------------------------------------------------------------
@@ -188,9 +198,28 @@
   async function loadSettings() {
     try {
       state.settings = await api('/api/settings');
+      renderIdentityStrip();
     } catch (err) {
       toast(`读取配置失败：${err.message}`, 'error');
     }
+  }
+
+  function renderIdentityStrip() {
+    if (!el.identityStrip) return;
+    const settings = state.settings || {};
+    const identity = settings.default_ssh_identity;
+    const roots = settings.allowed_roots || [];
+    el.identityStrip.hidden = false;
+    el.identityStrip.innerHTML = `<span class="identity-dot"></span>
+      <span class="identity-label">推送身份</span>
+      <span class="identity-name">${escapeHtml(identity ? identity.name : '系统 SSH 默认')}</span>
+      ${identity ? '<span class="badge source-default">全局默认</span>' : ''}
+      <span class="identity-sep">·</span>
+      <span class="identity-label">白名单根目录</span>
+      <span class="identity-name">${escapeHtml(roots.length ? roots.join('、') : '未配置')}</span>
+      <button class="btn-link" id="identity-manage">管理</button>`;
+    const manage = document.getElementById('identity-manage');
+    if (manage) manage.addEventListener('click', openSshModal);
   }
 
   async function loadRepos() {
@@ -381,9 +410,11 @@
       ${dirtyBlock}
       ${commitBlock}
       <div class="card-foot">
-        <div class="foot-meta"><span class="label">${escapeHtml(fetchText)}</span>${status.upstream ? ` · 上游 ${escapeHtml(status.upstream)}` : ''}</div>
+        <div class="foot-meta"><span class="label">${escapeHtml(fetchText)}</span>${status.upstream ? ` · 上游 ${escapeHtml(status.upstream)}` : ''}
+          <span class="foot-ssh" title="当前生效的推送身份">· SSH ${escapeHtml(status.ssh_identity ? status.ssh_identity.name : '系统默认')}</span></div>
         <div class="card-actions">
           <button class="btn btn-sub btn-sm" data-act="commit" ${dirty.total ? '' : 'disabled'} title="${dirty.total ? '勾选文件并提交' : '工作区干净，无需提交'}">提交</button>
+          <button class="btn btn-ghost btn-sm" data-act="ssh" title="为该仓库绑定 SSH 推送身份">身份</button>
           <button class="btn btn-ghost btn-sm" data-act="pull" title="git pull --ff-only">拉取</button>
           <button class="btn btn-ghost btn-sm" data-act="push" title="推送当前分支到上游">推送</button>
           <button class="btn btn-ghost btn-sm" data-act="fetch" title="git fetch --prune">获取远端</button>
@@ -462,6 +493,7 @@
     if (action === 'pull') return openPullModal(id);
     if (action === 'push') return openPushModal(id);
     if (action === 'commit') return openCommitModal(id);
+    if (action === 'ssh') return openRepoSshModal(id);
     if (action === 'remove') return removeRepo(id);
     return undefined;
   }
@@ -502,11 +534,18 @@
   function setModalFoot(html) { el.modalFoot.innerHTML = html; }
 
   function closeModal() {
+    if (state.scan && state.scan.pollTimer) {
+      window.clearTimeout(state.scan.pollTimer);
+    }
     el.backdrop.hidden = true;
     el.modalBody.innerHTML = '';
     el.modalFoot.innerHTML = '';
     document.body.style.overflow = '';
     state.browse = null;
+    state.scan = null;
+    state.roots = null;
+    state.ssh = null;
+    state.sshDraft = { editingId: null, testOutput: null };
   }
 
   function showModalError(message) {
@@ -1126,6 +1165,683 @@
   }
 
   // ------------------------------------------------------------------
+  // 白名单根目录管理
+  // ------------------------------------------------------------------
+
+  async function openRootsModal() {
+    state.roots = { items: [] };
+    openModal({
+      title: '允许的根目录',
+      wide: true,
+      body: '<div class="card-loading">正在读取根目录…</div>',
+      foot: '<button class="btn btn-ghost" id="roots-close">关闭</button>',
+    });
+    document.getElementById('roots-close').addEventListener('click', closeModal);
+    await loadRoots();
+  }
+
+  async function loadRoots() {
+    try {
+      const data = await api('/api/allowed-roots');
+      state.roots = { items: data.items || [] };
+      renderRoots();
+    } catch (err) {
+      showModalError(`读取根目录失败：${err.message}`);
+    }
+  }
+
+  function renderRoots() {
+    const roots = state.roots ? state.roots.items : [];
+    const rows = roots.length
+      ? roots.map((root) => `<div class="root-row">
+          <div class="root-row-main">
+            <div class="root-row-path" title="${escapeHtml(root.path)}">${escapeHtml(root.path)}</div>
+            <div class="root-row-meta">${escapeHtml(String(root.managed_repos))} 个受管仓库</div>
+          </div>
+          <button class="btn btn-danger btn-sm" data-root-remove="${root.id}">移除</button>
+        </div>`).join('')
+      : '<div class="dir-empty">尚未配置白名单根目录。</div>';
+
+    setModalBody(`
+      <div class="hint">所有扫描、添加与 git 操作都要求仓库位于以下根目录内；移除根目录不会删除受管仓库，但会让其超出白名单而不可操作。</div>
+      <div class="root-list">${rows}</div>
+      <div class="inline-form">
+        <input class="input" id="root-path" placeholder="输入绝对路径，例如 E:\\Code\\Projects">
+        <button class="btn btn-primary" id="root-add">添加根目录</button>
+      </div>
+      <div class="error-box" id="modal-error" hidden></div>`);
+    setModalFoot('<button class="btn btn-ghost" id="roots-close">关闭</button>');
+    document.getElementById('roots-close').addEventListener('click', closeModal);
+    document.getElementById('root-add').addEventListener('click', addRootPath);
+    document.getElementById('root-path').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') addRootPath();
+    });
+    document.querySelectorAll('[data-root-remove]').forEach((button) => {
+      button.addEventListener('click', () => removeRootPath(Number(button.dataset.rootRemove)));
+    });
+  }
+
+  async function addRootPath() {
+    const input = document.getElementById('root-path');
+    const path = input ? input.value.trim() : '';
+    if (!path) {
+      showModalError('请输入绝对路径。');
+      return;
+    }
+    const button = document.getElementById('root-add');
+    busyButton(button, true);
+    clearModalError();
+    try {
+      const result = await api('/api/allowed-roots', { method: 'POST', body: { path } });
+      await loadSettings();
+      await loadRoots();
+      toast(result.message || '根目录已添加。', 'success');
+    } catch (err) {
+      showModalError(`添加失败：${err.message}`);
+      busyButton(button, false);
+    }
+  }
+
+  async function removeRootPath(id) {
+    const item = (state.roots ? state.roots.items : []).find((root) => root.id === id);
+    if (!item) return;
+    const baseMessage = item.managed_repos
+      ? `该根目录下仍有 ${item.managed_repos} 个受管仓库。移除后这些仓库仍保留在列表，但会超出白名单而不可操作。\n\n继续移除？`
+      : `确定从白名单移除「${item.path}」？不会删除磁盘目录。`;
+    if (!window.confirm(baseMessage)) return;
+    try {
+      const result = await api(`/api/allowed-roots/${id}`, { method: 'DELETE' });
+      await afterRootChange(result.message);
+    } catch (err) {
+      if (err.status === 409 && err.payload && err.payload.code === 'root_in_use') {
+        if (!window.confirm(`${err.message}\n\n确认仍要移除？`)) return;
+        try {
+          const forced = await api(`/api/allowed-roots/${id}?force=true`, { method: 'DELETE' });
+          await afterRootChange(forced.message);
+        } catch (secondErr) {
+          showModalError(`移除失败：${secondErr.message}`);
+        }
+        return;
+      }
+      showModalError(`移除失败：${err.message}`);
+    }
+  }
+
+  async function afterRootChange(message) {
+    await loadSettings();
+    await loadRoots();
+    await loadRepos();
+    await refreshAll(true);
+    toast(message || '根目录已更新。', 'success');
+  }
+
+  // ------------------------------------------------------------------
+  // 仓库扫描
+  // ------------------------------------------------------------------
+
+  async function openScanModal() {
+    state.scan = {
+      roots: [],
+      selectedRoots: new Set(),
+      depth: (state.settings && state.settings.scan_max_depth) || 6,
+      limit: (state.settings && state.settings.scan_result_limit) || 200,
+      job: null,
+      selected: new Set(),
+      pollTimer: null,
+    };
+    openModal({
+      title: '扫描本地仓库',
+      wide: true,
+      body: '<div class="card-loading">正在读取白名单根目录…</div>',
+      foot: '<button class="btn btn-ghost" id="scan-close">关闭</button>',
+    });
+    document.getElementById('scan-close').addEventListener('click', closeModal);
+    try {
+      const data = await api('/api/allowed-roots');
+      state.scan.roots = data.items || [];
+      state.scan.selectedRoots = new Set(state.scan.roots.map((root) => root.path));
+      renderScan();
+    } catch (err) {
+      showModalError(`读取根目录失败：${err.message}`);
+    }
+  }
+
+  function renderScan() {
+    const scan = state.scan;
+    if (!scan) return;
+    const job = scan.job;
+    const running = job && job.status === 'running';
+    const rootsHtml = scan.roots.length
+      ? scan.roots.map((root) => `<label class="check inline scan-root">
+          <input type="checkbox" data-scan-root="${escapeHtml(root.path)}" ${scan.selectedRoots.has(root.path) ? 'checked' : ''} ${running ? 'disabled' : ''}>
+          <span title="${escapeHtml(root.path)}">${escapeHtml(root.name || root.path)}</span>
+        </label>`).join('')
+      : '<div class="warn-box">没有可用的白名单根目录，请先在「根目录」中添加。</div>';
+
+    const config = `<div class="scan-config">
+      <div class="scan-roots">${rootsHtml}</div>
+      <div class="scan-options">
+        <label class="field-inline"><span>最大深度</span>
+          <input class="input input-sm" id="scan-depth" type="number" min="1" max="12" value="${escapeHtml(scan.depth)}" ${running ? 'disabled' : ''}></label>
+        <label class="field-inline"><span>结果上限</span>
+          <input class="input input-sm" id="scan-limit" type="number" min="1" max="500" value="${escapeHtml(scan.limit)}" ${running ? 'disabled' : ''}></label>
+        <button class="btn btn-primary" id="scan-start" ${running || !scan.roots.length ? 'disabled' : ''}>${job ? '重新扫描' : '开始扫描'}</button>
+        ${running ? '<button class="btn btn-ghost" id="scan-cancel">停止</button>' : ''}
+      </div>
+      <div class="hint">只读扫描：不会执行任何 git 命令；自动跳过 node_modules、.venv、dist、build 等噪音目录与符号链接。</div>
+    </div>`;
+
+    let progress = '';
+    if (job) {
+      const statusText = {
+        running: '扫描中', done: '已完成', cancelled: '已停止', error: '出错',
+      }[job.status] || job.status;
+      progress = `<div class="scan-progress ${job.status === 'running' ? 'is-running' : ''}">
+        <div class="scan-progress-main">
+          <span class="scan-status">${escapeHtml(statusText)}</span>
+          <span>已扫描 <strong>${job.scanned_dirs}</strong> 个目录</span>
+          <span>发现 <strong>${job.found}</strong> 个仓库</span>
+          <span>耗时 ${escapeHtml(formatDuration(job.duration_ms))}</span>
+          ${job.truncated ? '<span class="badge warn">已达结果上限</span>' : ''}
+        </div>
+        ${job.error_samples && job.error_samples.length ? `<details class="scan-errors"><summary>读取失败的目录（${job.error_samples.length}）</summary><pre>${escapeHtml(job.error_samples.join('\n'))}</pre></details>` : ''}
+      </div>`;
+    }
+
+    const items = (job && job.items) || [];
+    const addable = items.filter((item) => !item.managed);
+    const rows = items.length
+      ? items.map((item) => {
+        const checked = scan.selected.has(item.path);
+        return `<tr class="${item.managed ? 'is-managed' : ''}">
+          <td class="cell-check"><input type="checkbox" data-scan-pick="${escapeHtml(item.path)}" ${item.managed ? 'disabled' : ''} ${checked ? 'checked' : ''}></td>
+          <td><div class="scan-name">${escapeHtml(item.name)}</div><div class="scan-path" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</div></td>
+          <td><span class="pill pill-branch">${escapeHtml(item.branch || (item.detached ? 'detached' : '无提交'))}</span></td>
+          <td>${item.managed ? '<span class="badge ok">已在管理</span>' : '<span class="badge neutral">未添加</span>'}</td>
+        </tr>`;
+      }).join('')
+      : (job && job.status !== 'running' ? '<tr><td colspan="4"><div class="dir-empty">没有发现 Git 仓库。</div></td></tr>' : '');
+
+    const table = job ? `<div class="scan-result-head">
+        <span>扫描结果（${items.length}${job.truncated ? '+ / 已截断' : ''}）</span>
+        <div class="scan-result-actions">
+          <button class="btn-link" id="scan-select-all" ${addable.length ? '' : 'disabled'}>全选可添加</button>
+          <button class="btn-link" id="scan-invert" ${addable.length ? '' : 'disabled'}>反选</button>
+        </div>
+      </div>
+      <div class="scan-table-wrap"><table class="scan-table">
+        <thead><tr><th class="cell-check"></th><th>仓库</th><th>分支</th><th>状态</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>` : '';
+
+    setModalBody(`${config}${progress}${table}<div class="error-box" id="modal-error" hidden></div>`);
+    const addCount = scan.selected.size;
+    setModalFoot(`<button class="btn btn-ghost" id="scan-close">关闭</button>
+      <button class="btn btn-primary" id="scan-add" ${addCount ? '' : 'disabled'}>批量添加选中（${addCount}）</button>`);
+    bindScanEvents();
+  }
+
+  function bindScanEvents() {
+    const scan = state.scan;
+    if (!scan) return;
+    document.getElementById('scan-close').addEventListener('click', closeModal);
+    document.querySelectorAll('[data-scan-root]').forEach((box) => {
+      box.addEventListener('change', () => {
+        if (box.checked) scan.selectedRoots.add(box.dataset.scanRoot);
+        else scan.selectedRoots.delete(box.dataset.scanRoot);
+      });
+    });
+    const depthInput = document.getElementById('scan-depth');
+    if (depthInput) depthInput.addEventListener('input', () => { scan.depth = depthInput.value; });
+    const limitInput = document.getElementById('scan-limit');
+    if (limitInput) limitInput.addEventListener('input', () => { scan.limit = limitInput.value; });
+    const startBtn = document.getElementById('scan-start');
+    if (startBtn) startBtn.addEventListener('click', startScan);
+    const cancelBtn = document.getElementById('scan-cancel');
+    if (cancelBtn) cancelBtn.addEventListener('click', cancelScan);
+    document.querySelectorAll('[data-scan-pick]').forEach((box) => {
+      box.addEventListener('change', () => {
+        if (box.checked) scan.selected.add(box.dataset.scanPick);
+        else scan.selected.delete(box.dataset.scanPick);
+        updateScanFoot();
+      });
+    });
+    const selectAll = document.getElementById('scan-select-all');
+    if (selectAll) {
+      selectAll.addEventListener('click', () => {
+        (scan.job.items || []).filter((item) => !item.managed).forEach((item) => scan.selected.add(item.path));
+        renderScan();
+      });
+    }
+    const invert = document.getElementById('scan-invert');
+    if (invert) {
+      invert.addEventListener('click', () => {
+        const next = new Set();
+        (scan.job.items || []).filter((item) => !item.managed).forEach((item) => {
+          if (!scan.selected.has(item.path)) next.add(item.path);
+        });
+        scan.selected = next;
+        renderScan();
+      });
+    }
+    const addBtn = document.getElementById('scan-add');
+    if (addBtn) addBtn.addEventListener('click', addScannedRepos);
+  }
+
+  function updateScanFoot() {
+    const scan = state.scan;
+    if (!scan) return;
+    const button = document.getElementById('scan-add');
+    if (button) {
+      button.textContent = `批量添加选中（${scan.selected.size}）`;
+      button.disabled = scan.selected.size === 0;
+    }
+  }
+
+  async function startScan() {
+    const scan = state.scan;
+    if (!scan) return;
+    const roots = Array.from(scan.selectedRoots);
+    if (!roots.length) {
+      showModalError('请至少选择一个扫描根目录。');
+      return;
+    }
+    const depth = Number(scan.depth) || 6;
+    const limit = Number(scan.limit) || 200;
+    const button = document.getElementById('scan-start');
+    busyButton(button, true);
+    clearModalError();
+    try {
+      const job = await api('/api/scan/start', {
+        method: 'POST',
+        body: { roots, max_depth: depth, limit },
+      });
+      scan.job = job;
+      scan.selected.clear();
+      renderScan();
+      pollScan();
+    } catch (err) {
+      showModalError(`启动扫描失败：${err.message}`);
+      busyButton(button, false);
+    }
+  }
+
+  function pollScan() {
+    const scan = state.scan;
+    if (!scan || !scan.job) return;
+    const jobId = scan.job.job_id;
+    if (scan.pollTimer) window.clearTimeout(scan.pollTimer);
+    const tick = async () => {
+      if (!state.scan || !state.scan.job || state.scan.job.job_id !== jobId) return;
+      try {
+        const job = await api(`/api/scan/${jobId}`);
+        if (!state.scan || state.scan.job.job_id !== jobId) return;
+        state.scan.job = job;
+        renderScan();
+        if (job.status === 'running') {
+          state.scan.pollTimer = window.setTimeout(tick, 500);
+        }
+      } catch (err) {
+        toast(`读取扫描进度失败：${err.message}`, 'error');
+      }
+    };
+    state.scan.pollTimer = window.setTimeout(tick, 500);
+  }
+
+  async function cancelScan() {
+    const scan = state.scan;
+    if (!scan || !scan.job) return;
+    try {
+      scan.job = await api(`/api/scan/${scan.job.job_id}/cancel`, { method: 'POST' });
+      renderScan();
+      toast('已请求停止扫描。', 'info');
+    } catch (err) {
+      toast(`停止扫描失败：${err.message}`, 'error');
+    }
+  }
+
+  async function addScannedRepos() {
+    const scan = state.scan;
+    if (!scan || !scan.selected.size) return;
+    const paths = Array.from(scan.selected);
+    const button = document.getElementById('scan-add');
+    busyButton(button, true);
+    try {
+      const result = await api('/api/repos', { method: 'POST', body: { paths } });
+      const added = result.added || 0;
+      const failed = (result.results || []).filter((item) => !item.ok).length;
+      const successKeys = new Set(
+        (result.results || []).filter((item) => item.ok).map((item) => normalizePath(item.path))
+      );
+      (scan.job.items || []).forEach((item) => {
+        if (successKeys.has(normalizePath(item.path))) item.managed = true;
+      });
+      scan.selected.clear();
+      await loadRepos();
+      refreshAll(true);
+      renderScan();
+      toast(`已添加 ${added} 个仓库${failed ? `，${failed} 条失败` : ''}。`, failed ? 'warn' : 'success');
+    } catch (err) {
+      showModalError(`批量添加失败：${err.message}`);
+      busyButton(button, false);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // SSH 身份
+  // ------------------------------------------------------------------
+
+  async function openSshModal() {
+    state.ssh = { scan: null, identities: [], default: null };
+    state.sshDraft = { editingId: null, testOutput: null };
+    openModal({
+      title: 'SSH 推送身份',
+      wide: true,
+      body: '<div class="card-loading">正在扫描本机 SSH 配置…</div>',
+      foot: '<button class="btn btn-ghost" id="ssh-close">关闭</button>',
+    });
+    document.getElementById('ssh-close').addEventListener('click', closeModal);
+    await loadSshData();
+  }
+
+  async function loadSshData() {
+    try {
+      const [scan, identities] = await Promise.all([
+        api('/api/ssh/scan'),
+        api('/api/ssh/identities'),
+      ]);
+      state.ssh = { scan, identities: identities.items || [], default: identities.default || null };
+      renderSsh();
+    } catch (err) {
+      showModalError(`读取 SSH 配置失败：${err.message}`);
+    }
+  }
+
+  function renderSsh() {
+    const ssh = state.ssh;
+    if (!ssh) return;
+    const scan = ssh.scan || { keys: [], hosts: [], ssh_dir: '' };
+    const identities = ssh.identities;
+    const draft = state.sshDraft;
+
+    const identityRows = identities.length
+      ? identities.map((item) => {
+        const flags = [
+          item.is_default ? '<span class="badge ok">全局默认</span>' : '',
+          item.enabled ? '' : '<span class="badge neutral">已禁用</span>',
+          item.bound_repos ? `<span class="badge neutral">绑定 ${item.bound_repos} 个仓库</span>` : '',
+          item.key_exists ? '' : '<span class="badge fail">密钥缺失</span>',
+        ].join(' ');
+        return `<div class="ssh-row ${item.enabled ? '' : 'is-disabled'}" data-ssh-row="${item.id}">
+          <div class="ssh-row-main">
+            <div class="ssh-row-title"><span class="ssh-name">${escapeHtml(item.name)}</span> ${flags}</div>
+            <div class="ssh-row-meta"><span title="${escapeHtml(item.key_path)}">${escapeHtml(item.key_path)}</span>
+              ${item.host_alias ? ` · Host ${escapeHtml(item.host_alias)}` : ' · 未配置 Host'}</div>
+            <div class="ssh-row-meta">${item.fingerprint ? `指纹 ${escapeHtml(item.fingerprint)}` : escapeHtml((item.warnings || []).join('；') || '无指纹信息')}</div>
+          </div>
+          <div class="ssh-row-actions">
+            <button class="btn btn-ghost btn-sm" data-ssh-test="${item.id}">测试连接</button>
+            ${item.is_default ? '' : `<button class="btn btn-ghost btn-sm" data-ssh-default="${item.id}" ${item.enabled ? '' : 'disabled'}>设为默认</button>`}
+            <button class="btn btn-ghost btn-sm" data-ssh-toggle="${item.id}" data-enabled="${item.enabled ? '1' : '0'}">${item.enabled ? '禁用' : '启用'}</button>
+            <button class="btn btn-ghost btn-sm" data-ssh-edit="${item.id}">编辑</button>
+            <button class="btn btn-danger btn-sm" data-ssh-delete="${item.id}">删除</button>
+          </div>
+        </div>`;
+      }).join('')
+      : '<div class="dir-empty">还没有配置身份。可从下方扫描结果一键添加，或手动填写。</div>';
+
+    const keyRows = (scan.keys || []).length
+      ? scan.keys.map((key) => `<div class="ssh-key-row">
+          <div class="ssh-row-main">
+            <div class="ssh-row-title"><span class="ssh-name">${escapeHtml(key.name)}</span>
+              ${key.configured ? '<span class="badge ok">已配置</span>' : ''}
+              ${key.encrypted ? '<span class="badge warn">已加密</span>' : ''}
+              ${key.readable ? '' : '<span class="badge fail">不可读</span>'}</div>
+            <div class="ssh-row-meta" title="${escapeHtml(key.key_path)}">${escapeHtml(key.key_path)}</div>
+            <div class="ssh-row-meta">${key.fingerprint ? `指纹 ${escapeHtml(key.fingerprint)}${key.bits ? ` · ${escapeHtml(key.bits)} 位` : ''}` : escapeHtml(key.warnings.join('；') || '无指纹信息')}
+              ${key.suggested_alias ? ` · 建议 Host ${escapeHtml(key.suggested_alias)}` : ''}
+              ${key.comment ? ` · ${escapeHtml(key.comment)}` : ''}</div>
+          </div>
+          <div class="ssh-row-actions">
+            <button class="btn btn-ghost btn-sm" data-ssh-adopt="${escapeHtml(key.key_path)}" data-alias="${escapeHtml(key.suggested_alias || '')}" data-name="${escapeHtml(key.name)}" ${key.configured ? 'disabled' : ''}>添加为身份</button>
+          </div>
+        </div>`).join('')
+      : `<div class="dir-empty">在 ${escapeHtml(scan.ssh_dir || '~/.ssh')} 中未发现私钥文件。</div>`;
+
+    const hosts = (scan.hosts || []).length
+      ? `<div class="ssh-hosts">config 中可用 Host：${scan.hosts.map((host) => `<span class="chip is-stitched">${escapeHtml(host)}</span>`).join('')}</div>`
+      : '';
+
+    const editing = draft.editingId;
+    const current = editing ? identities.find((item) => item.id === editing) : null;
+    const form = `<div class="ssh-form">
+      <div class="ssh-form-title">${editing ? `编辑身份：${escapeHtml(current ? current.name : '')}` : '手动新增身份'}</div>
+      <div class="ssh-form-grid">
+        <label class="field"><span>显示名</span><input class="input" id="ssh-name" value="${escapeHtml(current ? current.name : '')}" placeholder="例如 工作账号"></label>
+        <label class="field"><span>私钥路径</span><input class="input" id="ssh-key-path" value="${escapeHtml(current ? current.key_path : '')}" placeholder="C:\\Users\\me\\.ssh\\id_ed25519"></label>
+        <label class="field"><span>Host 别名（可选）</span><input class="input" id="ssh-host" value="${escapeHtml(current ? current.host_alias : '')}" placeholder="例如 github.com"></label>
+      </div>
+      <div class="ssh-form-actions">
+        <button class="btn btn-primary btn-sm" id="ssh-save">${editing ? '保存修改' : '保存身份'}</button>
+        ${editing ? '<button class="btn btn-ghost btn-sm" id="ssh-cancel-edit">取消编辑</button>' : ''}
+      </div>
+      <div class="hint">只保存路径与别名，不读取、不上传私钥正文；删除身份也不会删除磁盘密钥文件。</div>
+    </div>`;
+
+    const testBox = draft.testOutput
+      ? `<div class="ssh-test ${draft.testOutput.status === 'success' ? 'is-ok' : 'is-fail'}">
+          <div class="ssh-test-head">连接测试：${escapeHtml(draft.testOutput.identity_name)} → ${escapeHtml(draft.testOutput.host)}
+            <span class="badge ${draft.testOutput.status === 'success' ? 'ok' : 'fail'}">${escapeHtml(draft.testOutput.status)}</span>
+            ${draft.testOutput.permission_issue ? '<span class="badge warn">权限异常</span>' : ''}
+          </div>
+          <pre>${escapeHtml(draft.testOutput.output || '（无输出）')}</pre>
+          ${(draft.testOutput.warnings || []).length ? `<div class="hint">${escapeHtml(draft.testOutput.warnings.join('；'))}</div>` : ''}
+        </div>`
+      : '';
+
+    setModalBody(`
+      <div class="ssh-meta">
+        <span>SSH 目录：${escapeHtml(scan.ssh_dir || '—')}</span>
+        <span>全局默认：${escapeHtml(ssh.default ? ssh.default.name : '未设置（使用系统 SSH 默认）')}</span>
+      </div>
+      ${hosts}
+      <div class="ssh-section"><div class="ssh-section-head"><h3>已配置身份（${identities.length}）</h3></div>${identityRows}</div>
+      ${testBox}
+      <div class="ssh-section"><div class="ssh-section-head"><h3>扫描到的私钥（${(scan.keys || []).length}）</h3><button class="btn btn-ghost btn-sm" id="ssh-rescan">重新扫描</button></div>${keyRows}</div>
+      ${form}
+      <div class="error-box" id="modal-error" hidden></div>`);
+    setModalFoot('<button class="btn btn-ghost" id="ssh-close">关闭</button>');
+    bindSshEvents();
+  }
+
+  function bindSshEvents() {
+    document.getElementById('ssh-close').addEventListener('click', closeModal);
+    const rescan = document.getElementById('ssh-rescan');
+    if (rescan) rescan.addEventListener('click', async () => {
+      busyButton(rescan, true);
+      await loadSshData();
+    });
+    document.getElementById('ssh-save').addEventListener('click', saveSshIdentity);
+    const cancelEdit = document.getElementById('ssh-cancel-edit');
+    if (cancelEdit) cancelEdit.addEventListener('click', () => {
+      state.sshDraft.editingId = null;
+      renderSsh();
+    });
+    document.querySelectorAll('[data-ssh-edit]').forEach((button) => {
+      button.addEventListener('click', () => {
+        state.sshDraft.editingId = Number(button.dataset.sshEdit);
+        renderSsh();
+      });
+    });
+    document.querySelectorAll('[data-ssh-delete]').forEach((button) => {
+      button.addEventListener('click', () => deleteSshIdentity(Number(button.dataset.sshDelete)));
+    });
+    document.querySelectorAll('[data-ssh-default]').forEach((button) => {
+      button.addEventListener('click', () => setDefaultSsh(Number(button.dataset.sshDefault)));
+    });
+    document.querySelectorAll('[data-ssh-toggle]').forEach((button) => {
+      button.addEventListener('click', () => toggleSsh(
+        Number(button.dataset.sshToggle), button.dataset.enabled === '1'
+      ));
+    });
+    document.querySelectorAll('[data-ssh-test]').forEach((button) => {
+      button.addEventListener('click', () => testSsh(Number(button.dataset.sshTest), button));
+    });
+    document.querySelectorAll('[data-ssh-adopt]').forEach((button) => {
+      button.addEventListener('click', () => adoptSshKey(button.dataset.sshAdopt, button.dataset.alias, button.dataset.name, button));
+    });
+  }
+
+  async function saveSshIdentity() {
+    const nameInput = document.getElementById('ssh-name');
+    const keyInput = document.getElementById('ssh-key-path');
+    const hostInput = document.getElementById('ssh-host');
+    const payload = {
+      name: nameInput.value.trim(),
+      key_path: keyInput.value.trim(),
+      host_alias: hostInput.value.trim(),
+    };
+    if (!payload.name || !payload.key_path) {
+      showModalError('显示名与私钥路径必填。');
+      return;
+    }
+    const button = document.getElementById('ssh-save');
+    busyButton(button, true);
+    clearModalError();
+    try {
+      if (state.sshDraft.editingId) {
+        await api(`/api/ssh/identities/${state.sshDraft.editingId}`, { method: 'PATCH', body: payload });
+      } else {
+        await api('/api/ssh/identities', { method: 'POST', body: payload });
+      }
+      state.sshDraft.editingId = null;
+      state.sshDraft.testOutput = null;
+      await loadSettings();
+      await loadSshData();
+      toast('SSH 身份已保存。', 'success');
+    } catch (err) {
+      showModalError(`保存失败：${err.message}`);
+      busyButton(button, false);
+    }
+  }
+
+  async function deleteSshIdentity(id) {
+    const item = state.ssh.identities.find((candidate) => candidate.id === id);
+    if (!item) return;
+    if (!window.confirm(`删除身份「${item.name}」的配置记录？\n不会删除磁盘私钥文件，相关仓库绑定会被解除。`)) return;
+    try {
+      const result = await api(`/api/ssh/identities/${id}`, { method: 'DELETE' });
+      await loadSettings();
+      await loadSshData();
+      toast(result.message || '身份已删除。', 'success');
+    } catch (err) {
+      showModalError(`删除失败：${err.message}`);
+    }
+  }
+
+  async function setDefaultSsh(id) {
+    try {
+      await api(`/api/ssh/identities/${id}/default`, { method: 'POST' });
+      await loadSettings();
+      await loadSshData();
+      toast('已设为全局默认身份。', 'success');
+    } catch (err) {
+      showModalError(`设置默认失败：${err.message}`);
+    }
+  }
+
+  async function toggleSsh(id, enabled) {
+    try {
+      await api(`/api/ssh/identities/${id}`, { method: 'PATCH', body: { enabled: !enabled } });
+      await loadSettings();
+      await loadSshData();
+      toast(`身份已${enabled ? '禁用' : '启用'}。`, 'success');
+    } catch (err) {
+      showModalError(`更新失败：${err.message}`);
+    }
+  }
+
+  async function testSsh(id, button) {
+    busyButton(button, true);
+    try {
+      const result = await api(`/api/ssh/identities/${id}/test`, { method: 'POST', body: {} });
+      state.sshDraft.testOutput = result;
+      renderSsh();
+    } catch (err) {
+      showModalError(`测试失败：${err.message}`);
+      busyButton(button, false);
+    }
+  }
+
+  async function adoptSshKey(keyPath, alias, name, button) {
+    busyButton(button, true);
+    try {
+      await api('/api/ssh/identities', {
+        method: 'POST',
+        body: { name: name || basename(keyPath), key_path: keyPath, host_alias: alias || '' },
+      });
+      await loadSettings();
+      await loadSshData();
+      toast('已添加为 SSH 身份。', 'success');
+    } catch (err) {
+      showModalError(`添加失败：${err.message}`);
+      busyButton(button, false);
+    }
+  }
+
+  async function openRepoSshModal(id) {
+    const repo = repoById(id);
+    if (!repo) return;
+    openModal({
+      title: `仓库 SSH 身份 · ${repo.name}`,
+      body: '<div class="card-loading">正在读取身份配置…</div>',
+      foot: '<button class="btn btn-ghost" id="repo-ssh-close">关闭</button>',
+    });
+    document.getElementById('repo-ssh-close').addEventListener('click', closeModal);
+    try {
+      const data = await api('/api/ssh/identities');
+      const status = statusById(id);
+      const current = status && status.ssh_identity;
+      const options = (data.items || []).filter((item) => item.enabled).map((item) => {
+        const selected = current && current.source === 'repo' && current.id === item.id;
+        return `<option value="${item.id}" ${selected ? 'selected' : ''}>${escapeHtml(item.name)}${item.is_default ? '（全局默认）' : ''}</option>`;
+      }).join('');
+      setModalBody(`<div class="hint">仓库级绑定优先于全局默认；切换只影响后续的 fetch / pull / push，并会记录到审计日志。</div>
+        <div class="kv-row"><span class="label">当前生效</span>
+          <strong>${escapeHtml(current ? current.name : '系统 SSH 默认')}</strong>
+          ${current ? `<span class="badge neutral">${current.source === 'repo' ? '仓库绑定' : '全局默认'}</span>` : ''}</div>
+        <label class="field" style="margin-top:14px"><span>绑定身份</span>
+          <select class="input" id="repo-ssh-select">
+            <option value="">不绑定（使用全局默认）</option>
+            ${options}
+          </select></label>
+        ${(data.items || []).length ? '' : '<div class="warn-box">还没有可用身份，请先在「SSH 身份」中添加。</div>'}
+        <div class="error-box" id="modal-error" hidden></div>`);
+      setModalFoot(`<button class="btn btn-ghost" id="repo-ssh-close">关闭</button>
+        <button class="btn btn-primary" id="repo-ssh-save">保存绑定</button>`);
+      document.getElementById('repo-ssh-close').addEventListener('click', closeModal);
+      document.getElementById('repo-ssh-save').addEventListener('click', async () => {
+        const select = document.getElementById('repo-ssh-select');
+        const value = select.value ? Number(select.value) : null;
+        const saveBtn = document.getElementById('repo-ssh-save');
+        busyButton(saveBtn, true);
+        try {
+          await api(`/api/repos/${id}/ssh-identity`, { method: 'PUT', body: { identity_id: value } });
+          await loadSettings();
+          await refreshOne(id, true);
+          toast('仓库 SSH 身份绑定已更新。', 'success');
+          closeModal();
+        } catch (err) {
+          showModalError(`保存失败：${err.message}`);
+          busyButton(saveBtn, false);
+        }
+      });
+    } catch (err) {
+      showModalError(`读取身份失败：${err.message}`);
+    }
+  }
+
+  // ------------------------------------------------------------------
   // 审计视图
   // ------------------------------------------------------------------
 
@@ -1211,16 +1927,19 @@
         <td class="cell-time">${escapeHtml(formatDateTime(item.ts))}</td>
         <td class="cell-repo" title="${escapeHtml(item.repo_path || '')}">${escapeHtml(repoName)}</td>
         <td class="cell-action">${escapeHtml(actionLabel)}${item.forced ? '<span class="badge forced">强制</span>' : ''}</td>
+        <td class="cell-identity">${escapeHtml(item.identity_name || '—')}</td>
         <td class="cell-command" title="${escapeHtml(item.command)}">${escapeHtml(item.command)}</td>
         <td><span class="badge exit">${escapeHtml(item.exit_code)}</span></td>
         <td class="cell-duration">${escapeHtml(formatDuration(item.duration_ms))}</td>
         <td><span class="badge ${item.ok ? 'ok' : 'fail'}">${item.ok ? '成功' : '失败'}</span></td>
         <td class="cell-summary" title="${escapeHtml(summary)}">${escapeHtml(summary.split('\n')[0] || '—')}</td>
       </tr>
-      <tr class="audit-detail-row" hidden><td colspan="8">
+      <tr class="audit-detail-row" hidden><td colspan="9">
         <div class="audit-detail">
           <div class="label">完整命令</div>
           <pre>${escapeHtml(item.command)}</pre>
+          <div class="label">SSH 身份</div>
+          <pre>${escapeHtml(item.identity_name || '（未使用配置身份）')}</pre>
           <div class="label">输出摘要</div>
           <pre>${escapeHtml(summary)}</pre>
         </div>
@@ -1244,6 +1963,9 @@
     el.btnRefresh.addEventListener('click', () => refreshAll(false));
     el.btnAdd.addEventListener('click', openAddRepoModal);
     el.btnAddEmpty.addEventListener('click', openAddRepoModal);
+    el.btnRoot.addEventListener('click', openRootsModal);
+    el.btnSsh.addEventListener('click', openSshModal);
+    el.btnScan.addEventListener('click', openScanModal);
 
     el.grid.addEventListener('click', (event) => {
       const button = event.target.closest('[data-act]');

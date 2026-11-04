@@ -22,7 +22,7 @@ from .db import Database
 from .git_runner import GitExecutor
 from .services import ApiError, GitManagerService
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_DIR = Path(__file__).resolve().parent
 
 settings: Settings = load_settings()
@@ -32,6 +32,8 @@ executor = GitExecutor(
     settings.git_timeout_seconds,
     database,
     settings.output_summary_limit,
+    settings.ssh_executable,
+    settings.ssh_keygen_executable,
 )
 service = GitManagerService(settings, database, executor)
 
@@ -50,12 +52,13 @@ async def lifespan(_: FastAPI):
     返回值：
         None（作为异步上下文管理器）。
     """
-    purged = database.init(settings.log_retention_days)
+    purged = database.init(settings.log_retention_days, settings.allowed_roots)
+    roots = service.allowed_root_paths()
     logger.info(
         "GitManager 启动：监听 %s:%s，白名单根目录 %s，清理超期审计 %s 条",
         settings.host,
         settings.port,
-        "、".join(str(root) for root in settings.allowed_roots),
+        "、".join(str(root) for root in roots),
         purged,
     )
     yield
@@ -168,7 +171,7 @@ async def handle_unexpected(_: Request, exc: Exception) -> JSONResponse:
 class AddReposRequest(BaseModel):
     """批量添加仓库请求。"""
 
-    paths: list[str] = Field(..., min_length=1, max_length=50, description="仓库绝对路径列表")
+    paths: list[str] = Field(..., min_length=1, max_length=500, description="仓库绝对路径列表")
 
 
 class PullRequest(BaseModel):
@@ -191,6 +194,52 @@ class CommitRequest(BaseModel):
 
     files: list[str] = Field(..., min_length=1, max_length=1000, description="勾选的文件路径")
     message: str = Field(..., min_length=1, max_length=5000, description="提交信息")
+
+
+class AllowedRootRequest(BaseModel):
+    """新增白名单根目录请求。"""
+
+    path: str = Field(..., min_length=1, max_length=1000, description="根目录绝对路径")
+
+
+class ScanStartRequest(BaseModel):
+    """启动仓库扫描请求。"""
+
+    roots: list[str] = Field(default_factory=list, max_length=20, description="扫描根目录；空表示全部白名单")
+    max_depth: int | None = Field(None, ge=1, le=12, description="最大扫描深度")
+    limit: int | None = Field(None, ge=1, le=500, description="结果条数上限")
+
+
+class SshIdentityCreateRequest(BaseModel):
+    """新增 SSH 身份请求。"""
+
+    name: str = Field(..., min_length=1, max_length=60, description="显示名")
+    key_path: str = Field(..., min_length=1, max_length=1000, description="私钥绝对路径")
+    host_alias: str = Field("", max_length=255, description="可选 Host 别名")
+    enabled: bool = Field(True, description="是否启用")
+    is_default: bool = Field(False, description="是否设为全局默认")
+
+
+class SshIdentityUpdateRequest(BaseModel):
+    """更新 SSH 身份请求（字段均可选）。"""
+
+    name: str | None = Field(None, min_length=1, max_length=60)
+    key_path: str | None = Field(None, min_length=1, max_length=1000)
+    host_alias: str | None = Field(None, max_length=255)
+    enabled: bool | None = None
+    is_default: bool | None = None
+
+
+class RepoSshBindRequest(BaseModel):
+    """仓库 SSH 身份绑定请求。"""
+
+    identity_id: int | None = Field(None, ge=1, description="身份 id；null 表示清除绑定")
+
+
+class SshTestRequest(BaseModel):
+    """SSH 连接测试请求。"""
+
+    host: str | None = Field(None, max_length=255, description="可选，覆盖身份中的 Host 别名")
 
 
 # ----------------------------------------------------------------------
@@ -217,15 +266,28 @@ def get_settings() -> dict[str, Any]:
     参数：
         无。
     返回值：
-        监听地址、git 路径、白名单根目录、日志保留天数与 pull stash 默认值。
+        监听地址、git 路径、动态白名单根目录、扫描参数、日志保留天数与 pull stash 默认值。
     """
+    roots = service.allowed_root_paths()
+    default_identity = next(
+        (item for item in service.list_ssh_identities()["items"] if item["is_default"]),
+        None,
+    )
     return {
         "host": settings.host,
         "port": settings.port,
         "git_executable": settings.git_executable,
-        "allowed_roots": [str(root) for root in settings.allowed_roots],
+        "allowed_roots": [str(root) for root in roots],
         "log_retention_days": settings.log_retention_days,
         "pull_auto_stash_default": settings.pull_auto_stash_default,
+        "scan_max_depth": settings.scan_max_depth,
+        "scan_result_limit": settings.scan_result_limit,
+        "ssh_dir": str(settings.ssh_dir),
+        "default_ssh_identity": (
+            {"id": default_identity["id"], "name": default_identity["name"]}
+            if default_identity
+            else None
+        ),
         "version": APP_VERSION,
     }
 
@@ -293,6 +355,92 @@ def fs_list(path: str | None = Query(None, description="要浏览的目录；为
         目录列表与导航信息。
     """
     return service.browse_dirs(path)
+
+
+# ----------------------------------------------------------------------
+# 白名单根目录管理
+# ----------------------------------------------------------------------
+
+
+@app.get("/api/allowed-roots")
+def list_allowed_roots() -> dict[str, Any]:
+    """列出白名单根目录及受管仓库数量。
+
+    参数：
+        无。
+    返回值：
+        {"items": [{id, path, name, managed_repos}]}。
+    """
+    return service.list_allowed_roots()
+
+
+@app.post("/api/allowed-roots")
+def add_allowed_root(payload: AllowedRootRequest) -> dict[str, Any]:
+    """新增白名单根目录（规范化并持久化到 SQLite）。
+
+    参数：
+        payload: 根目录路径。
+    返回值：
+        新增的根目录信息。
+    """
+    return service.add_allowed_root(payload.path)
+
+
+@app.delete("/api/allowed-roots/{root_id}")
+def remove_allowed_root(
+    root_id: int,
+    force: bool = Query(False, description="存在受管仓库时是否强制移除"),
+) -> dict[str, Any]:
+    """移除白名单根目录（默认在仍有受管仓库时拒绝）。
+
+    参数：
+        root_id: 根目录主键。
+        force: 是否强制移除。
+    返回值：
+        移除结果与受影响仓库数量。
+    """
+    return service.remove_allowed_root(root_id, force)
+
+
+# ----------------------------------------------------------------------
+# 仓库扫描（只读）
+# ----------------------------------------------------------------------
+
+
+@app.post("/api/scan/start")
+def start_scan(payload: ScanStartRequest) -> dict[str, Any]:
+    """启动只读仓库扫描任务。
+
+    参数：
+        payload: 扫描根目录、深度与结果上限。
+    返回值：
+        任务快照（含 job_id，供前端轮询进度）。
+    """
+    return service.start_scan(payload.roots, payload.max_depth, payload.limit)
+
+
+@app.get("/api/scan/{job_id}")
+def get_scan(job_id: str) -> dict[str, Any]:
+    """查询扫描任务进度与结果。
+
+    参数：
+        job_id: 任务 id。
+    返回值：
+        任务快照。
+    """
+    return service.get_scan(job_id)
+
+
+@app.post("/api/scan/{job_id}/cancel")
+def cancel_scan(job_id: str) -> dict[str, Any]:
+    """取消扫描任务。
+
+    参数：
+        job_id: 任务 id。
+    返回值：
+        任务快照。
+    """
+    return service.cancel_scan(job_id)
 
 
 # ----------------------------------------------------------------------
@@ -408,6 +556,112 @@ def commit_repo(repo_id: int, payload: CommitRequest) -> dict[str, Any]:
         提交结果与新提交信息。
     """
     return service.commit_repository(repo_id, payload.files, payload.message)
+
+
+# ----------------------------------------------------------------------
+# SSH 身份
+# ----------------------------------------------------------------------
+
+
+@app.get("/api/ssh/scan")
+def scan_ssh() -> dict[str, Any]:
+    """扫描本机 SSH 私钥与 Host 别名（只读，不读取私钥正文）。
+
+    参数：
+        无。
+    返回值：
+        {"ssh_dir", "hosts", "keys": [...]}。
+    """
+    return service.scan_ssh()
+
+
+@app.get("/api/ssh/identities")
+def list_ssh_identities() -> dict[str, Any]:
+    """列出已配置的 SSH 身份与全局默认。
+
+    参数：
+        无。
+    返回值：
+        {"items": [...], "default": {...} | None}。
+    """
+    return service.list_ssh_identities()
+
+
+@app.post("/api/ssh/identities")
+def create_ssh_identity(payload: SshIdentityCreateRequest) -> dict[str, Any]:
+    """新增 SSH 身份配置。
+
+    参数：
+        payload: 身份字段。
+    返回值：
+        新增的身份。
+    """
+    return service.create_ssh_identity(payload.model_dump())
+
+
+@app.patch("/api/ssh/identities/{identity_id}")
+def update_ssh_identity(identity_id: int, payload: SshIdentityUpdateRequest) -> dict[str, Any]:
+    """更新 SSH 身份配置（仅更新传入字段）。
+
+    参数：
+        identity_id: 身份主键。
+        payload: 可选字段。
+    返回值：
+        更新后的身份。
+    """
+    return service.update_ssh_identity(
+        identity_id, payload.model_dump(exclude_unset=True)
+    )
+
+
+@app.delete("/api/ssh/identities/{identity_id}")
+def delete_ssh_identity(identity_id: int) -> dict[str, Any]:
+    """删除 SSH 身份配置（不删除磁盘密钥文件）。
+
+    参数：
+        identity_id: 身份主键。
+    返回值：
+        删除结果。
+    """
+    return service.delete_ssh_identity(identity_id)
+
+
+@app.post("/api/ssh/identities/{identity_id}/default")
+def set_default_ssh_identity(identity_id: int) -> dict[str, Any]:
+    """设置全局默认 SSH 身份。
+
+    参数：
+        identity_id: 身份主键。
+    返回值：
+        更新后的身份。
+    """
+    return service.set_default_ssh_identity(identity_id)
+
+
+@app.post("/api/ssh/identities/{identity_id}/test")
+def test_ssh_identity(identity_id: int, payload: SshTestRequest) -> dict[str, Any]:
+    """测试 SSH 身份连接（BatchMode，超时短）。
+
+    参数：
+        identity_id: 身份主键。
+        payload: 可选 Host 覆盖。
+    返回值：
+        连接测试结果。
+    """
+    return service.test_ssh_identity(identity_id, payload.host)
+
+
+@app.put("/api/repos/{repo_id}/ssh-identity")
+def bind_repo_ssh_identity(repo_id: int, payload: RepoSshBindRequest) -> dict[str, Any]:
+    """设置或清除仓库级 SSH 身份绑定。
+
+    参数：
+        repo_id: 仓库主键。
+        payload: 身份 id；null 表示清除。
+    返回值：
+        生效身份。
+    """
+    return service.bind_repo_ssh_identity(repo_id, payload.identity_id)
 
 
 # ----------------------------------------------------------------------
